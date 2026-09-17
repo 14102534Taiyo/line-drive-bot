@@ -28,10 +28,99 @@ const drive = google.drive({ version: 'v3', auth: driveAuth });
 const sheets = google.sheets({ version: 'v4', auth: sheetsAuth });
 const SHEET_NAME = 'ชีต1';
 const SHEET_RANGE = `${SHEET_NAME}!A:D`;
+const DRIVE_CONFIG_SHEET = 'DriveConfig';
+const DRIVE_CONFIG_RANGE = `${DRIVE_CONFIG_SHEET}!A:C`;
 const REMINDER_MINUTES_BEFORE = Number(process.env.REMINDER_MINUTES_BEFORE || 30);
 const BANGKOK_UTC_OFFSET_HOURS = 7;
 
+async function ensureDriveConfigSheet() {
+  const meta = await sheets.spreadsheets.get({ spreadsheetId: process.env.GOOGLE_SHEET_ID });
+  const exists = meta.data.sheets.some((s) => s.properties.title === DRIVE_CONFIG_SHEET);
+  if (exists) return;
+
+  await sheets.spreadsheets.batchUpdate({
+    spreadsheetId: process.env.GOOGLE_SHEET_ID,
+    requestBody: { requests: [{ addSheet: { properties: { title: DRIVE_CONFIG_SHEET } } }] },
+  });
+  await sheets.spreadsheets.values.update({
+    spreadsheetId: process.env.GOOGLE_SHEET_ID,
+    range: `${DRIVE_CONFIG_SHEET}!A1:C1`,
+    valueInputOption: 'RAW',
+    requestBody: { values: [['groupId', 'refreshToken', 'folderId']] },
+  });
+  console.log('Created DriveConfig sheet tab');
+}
+
+function createWebOAuthClient() {
+  return new google.auth.OAuth2(
+    process.env.GOOGLE_OAUTH_WEB_CLIENT_ID,
+    process.env.GOOGLE_OAUTH_WEB_CLIENT_SECRET,
+    `${process.env.BASE_URL}/oauth2callback`
+  );
+}
+
+function buildSetupUrl(groupId) {
+  return `${process.env.BASE_URL}/setup?groupId=${encodeURIComponent(groupId)}`;
+}
+
+async function getDriveConfig(groupId) {
+  const res = await sheets.spreadsheets.values.get({
+    spreadsheetId: process.env.GOOGLE_SHEET_ID,
+    range: DRIVE_CONFIG_RANGE,
+  });
+  const rows = res.data.values || [];
+  const row = rows.find((r) => r[0] === groupId);
+  return row ? { refreshToken: row[1], folderId: row[2] } : null;
+}
+
+async function setDriveConfig(groupId, refreshToken, folderId) {
+  const res = await sheets.spreadsheets.values.get({
+    spreadsheetId: process.env.GOOGLE_SHEET_ID,
+    range: DRIVE_CONFIG_RANGE,
+  });
+  const rows = res.data.values || [];
+  const rowIndex = rows.findIndex((r) => r[0] === groupId);
+
+  if (rowIndex === -1) {
+    await sheets.spreadsheets.values.append({
+      spreadsheetId: process.env.GOOGLE_SHEET_ID,
+      range: DRIVE_CONFIG_RANGE,
+      valueInputOption: 'RAW',
+      requestBody: { values: [[groupId, refreshToken, folderId]] },
+    });
+  } else {
+    await sheets.spreadsheets.values.update({
+      spreadsheetId: process.env.GOOGLE_SHEET_ID,
+      range: `${DRIVE_CONFIG_SHEET}!A${rowIndex + 1}:C${rowIndex + 1}`,
+      valueInputOption: 'RAW',
+      requestBody: { values: [[groupId, refreshToken, folderId]] },
+    });
+  }
+}
+
 const groupFolderCache = new Map();
+const driveClientCache = new Map();
+
+async function getDriveClientForSource(source) {
+  const key = source.groupId || source.userId;
+  if (driveClientCache.has(key)) return driveClientCache.get(key);
+
+  const config = await getDriveConfig(key);
+  let result;
+  if (config) {
+    const userAuth = new google.auth.OAuth2(
+      process.env.GOOGLE_OAUTH_WEB_CLIENT_ID,
+      process.env.GOOGLE_OAUTH_WEB_CLIENT_SECRET
+    );
+    userAuth.setCredentials({ refresh_token: config.refreshToken });
+    result = { drive: google.drive({ version: 'v3', auth: userAuth }), folderId: config.folderId };
+  } else {
+    result = { drive, folderId: await getOrCreateGroupFolder(source) };
+  }
+
+  driveClientCache.set(key, result);
+  return result;
+}
 
 async function getOrCreateGroupFolder(source) {
   const groupId = source.groupId || source.userId;
@@ -72,8 +161,8 @@ async function getOrCreateGroupFolder(source) {
   return folderId;
 }
 
-async function uploadToDrive(fileName, mimeType, contentStream, folderId) {
-  const res = await drive.files.create({
+async function uploadToDrive(driveClient, fileName, mimeType, contentStream, folderId) {
+  const res = await driveClient.files.create({
     requestBody: {
       name: fileName,
       parents: [folderId],
@@ -98,13 +187,13 @@ async function handleFileMessage(message, source) {
     ? 'application/octet-stream'
     : 'image/jpeg';
 
-  const folderId = await getOrCreateGroupFolder(source);
+  const { drive: driveClient, folderId } = await getDriveClientForSource(source);
 
   const contentStream = await lineClient.getMessageContent(message.id);
   const passthrough = new stream.PassThrough();
   contentStream.pipe(passthrough);
 
-  const uploaded = await uploadToDrive(fileName, mimeType, passthrough, folderId);
+  const uploaded = await uploadToDrive(driveClient, fileName, mimeType, passthrough, folderId);
   console.log(`Uploaded "${fileName}" -> ${uploaded.webViewLink}`);
 }
 
@@ -139,7 +228,18 @@ function parseAppointment(text) {
 }
 
 async function handleTextMessage(event) {
-  const appointment = parseAppointment(event.message.text);
+  const text = event.message.text.trim();
+  const groupOrUserId = event.source.groupId || event.source.userId;
+
+  if (text === '/setup') {
+    await lineClient.replyMessage(event.replyToken, {
+      type: 'text',
+      text: `เชื่อมต่อ Google Drive ของคุณเองได้ที่ลิงก์นี้ (login ด้วย Google แล้วกด Allow):\n${buildSetupUrl(groupOrUserId)}`,
+    });
+    return;
+  }
+
+  const appointment = parseAppointment(text);
   if (!appointment) return;
 
   if (appointment.eventTimeMs <= Date.now()) {
@@ -150,13 +250,12 @@ async function handleTextMessage(event) {
     return;
   }
 
-  const groupId = event.source.groupId || event.source.userId;
   await sheets.spreadsheets.values.append({
     spreadsheetId: process.env.GOOGLE_SHEET_ID,
     range: SHEET_RANGE,
     valueInputOption: 'RAW',
     requestBody: {
-      values: [[groupId, new Date(appointment.eventTimeMs).toISOString(), appointment.label, 'FALSE']],
+      values: [[groupOrUserId, new Date(appointment.eventTimeMs).toISOString(), appointment.label, 'FALSE']],
     },
   });
 
@@ -220,8 +319,57 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
 
 app.get('/', (_req, res) => res.send('LINE Drive Bot is running'));
 
+app.get('/setup', (req, res) => {
+  const { groupId } = req.query;
+  if (!groupId) return res.status(400).send('missing groupId');
+
+  const url = createWebOAuthClient().generateAuthUrl({
+    access_type: 'offline',
+    prompt: 'consent',
+    scope: ['https://www.googleapis.com/auth/drive'],
+    state: groupId,
+  });
+  res.redirect(url);
+});
+
+app.get('/oauth2callback', async (req, res) => {
+  const { code, state: groupId } = req.query;
+  if (!code || !groupId) return res.status(400).send('missing code or state');
+
+  try {
+    const { tokens } = await createWebOAuthClient().getToken(code);
+
+    const userAuth = new google.auth.OAuth2(
+      process.env.GOOGLE_OAUTH_WEB_CLIENT_ID,
+      process.env.GOOGLE_OAUTH_WEB_CLIENT_SECRET
+    );
+    userAuth.setCredentials({ refresh_token: tokens.refresh_token });
+    const userDrive = google.drive({ version: 'v3', auth: userAuth });
+
+    const folder = await userDrive.files.create({
+      requestBody: { name: 'LINE Bot Files', mimeType: 'application/vnd.google-apps.folder' },
+      fields: 'id',
+    });
+
+    await setDriveConfig(groupId, tokens.refresh_token, folder.data.id);
+    driveClientCache.set(groupId, { drive: userDrive, folderId: folder.data.id });
+
+    await lineClient.pushMessage(groupId, {
+      type: 'text',
+      text: '✅ เชื่อมต่อ Google Drive ของคุณสำเร็จ ไฟล์ในแชทนี้จากนี้ไปจะถูกเก็บใน Drive ของคุณเอง',
+    });
+
+    res.send('เชื่อมต่อสำเร็จ ปิดหน้านี้แล้วกลับไปที่ LINE ได้เลยครับ');
+  } catch (err) {
+    console.error('OAuth callback failed:', err);
+    res.status(500).send('เชื่อมต่อไม่สำเร็จ ลองพิมพ์ /setup ใหม่อีกครั้ง');
+  }
+});
+
 const port = process.env.PORT || 3000;
 app.listen(port, () => console.log(`Listening on port ${port}`));
+
+ensureDriveConfigSheet().catch((err) => console.error('Failed to ensure DriveConfig sheet:', err));
 
 setInterval(() => {
   checkReminders().catch((err) => console.error('Reminder check failed:', err));
