@@ -31,11 +31,52 @@ const SHEET_RANGE = `${SHEET_NAME}!A:D`;
 const REMINDER_MINUTES_BEFORE = Number(process.env.REMINDER_MINUTES_BEFORE || 30);
 const BANGKOK_UTC_OFFSET_HOURS = 7;
 
-async function uploadToDrive(fileName, mimeType, contentStream) {
+const groupFolderCache = new Map();
+
+async function getOrCreateGroupFolder(source) {
+  const groupId = source.groupId || source.userId;
+  if (groupFolderCache.has(groupId)) return groupFolderCache.get(groupId);
+
+  let folderName = groupId;
+  if (source.groupId) {
+    try {
+      const summary = await lineClient.getGroupSummary(source.groupId);
+      folderName = summary.groupName;
+    } catch {
+      // ไม่มีสิทธิ์ดึงชื่อกลุ่ม ใช้ groupId แทน
+    }
+  }
+
+  const parentId = process.env.GOOGLE_DRIVE_FOLDER_ID;
+  const existing = await drive.files.list({
+    q: `'${parentId}' in parents and name = '${folderName.replace(/'/g, "\\'")}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false`,
+    fields: 'files(id, name)',
+  });
+
+  let folderId;
+  if (existing.data.files.length > 0) {
+    folderId = existing.data.files[0].id;
+  } else {
+    const created = await drive.files.create({
+      requestBody: {
+        name: folderName,
+        mimeType: 'application/vnd.google-apps.folder',
+        parents: [parentId],
+      },
+      fields: 'id',
+    });
+    folderId = created.data.id;
+  }
+
+  groupFolderCache.set(groupId, folderId);
+  return folderId;
+}
+
+async function uploadToDrive(fileName, mimeType, contentStream, folderId) {
   const res = await drive.files.create({
     requestBody: {
       name: fileName,
-      parents: [process.env.GOOGLE_DRIVE_FOLDER_ID],
+      parents: [folderId],
     },
     media: {
       mimeType,
@@ -50,18 +91,20 @@ function extensionFor(messageType) {
   return messageType === 'image' ? 'jpg' : 'pdf';
 }
 
-async function handleFileMessage(message) {
+async function handleFileMessage(message, source) {
   const isFile = message.type === 'file';
   const fileName = isFile ? message.fileName : `image_${message.id}.${extensionFor('image')}`;
   const mimeType = isFile
     ? 'application/octet-stream'
     : 'image/jpeg';
 
+  const folderId = await getOrCreateGroupFolder(source);
+
   const contentStream = await lineClient.getMessageContent(message.id);
   const passthrough = new stream.PassThrough();
   contentStream.pipe(passthrough);
 
-  const uploaded = await uploadToDrive(fileName, mimeType, passthrough);
+  const uploaded = await uploadToDrive(fileName, mimeType, passthrough, folderId);
   console.log(`Uploaded "${fileName}" -> ${uploaded.webViewLink}`);
 }
 
@@ -127,7 +170,7 @@ async function handleEvent(event) {
   if (event.type !== 'message') return;
   const { message } = event;
   if (message.type === 'image' || message.type === 'file') {
-    await handleFileMessage(message);
+    await handleFileMessage(message, event.source);
   } else if (message.type === 'text') {
     await handleTextMessage(event);
   }
