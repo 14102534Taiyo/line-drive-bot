@@ -11,7 +11,7 @@
 ```
 /นัด 17092026 14.00 สอบ CFO
 ```
-รูปแบบ: `/นัด วันเดือนปี(ไม่มีขีด) ชั่วโมง.นาที ข้อความ` — บอทเตือนล่วงหน้า `REMINDER_MINUTES_BEFORE` นาที (ค่าเริ่มต้น 30)
+รูปแบบ: `/นัด วันเดือนปี(ไม่มีขีด) ชั่วโมง.นาที ข้อความ` — บอทเตือนล่วงหน้าหลายระดับอัตโนมัติ: **7 วัน, 1 วัน, 1 ชั่วโมง, 5 นาที** ก่อนถึงเวลานัด (แก้ระดับได้ที่ `REMINDER_LEVELS` ใน `index.js`)
 
 **สรุปแชทรายวัน:** ทุกข้อความในกลุ่มถูกบันทึกลง Google Sheet แท็บ `ChatLog` แบบ real-time แล้วมี endpoint `GET /cron/daily-summary?secret=...` ให้ cron ภายนอกยิงมาทุกวันตามเวลาที่ตั้งไว้ — บอทจะสรุปแยกตามกลุ่ม (ใช้ Gemini API) ส่งกลับเข้ากลุ่ม แล้วล้าง log ของวันนั้นทิ้ง กลุ่มที่ไม่มีข้อความจะถูกข้ามอัตโนมัติ
 
@@ -113,7 +113,6 @@ git commit -m "Add LINE Drive bot"
    - `GOOGLE_OAUTH_CLIENT_ID`
    - `GOOGLE_OAUTH_CLIENT_SECRET`
    - `GOOGLE_OAUTH_REFRESH_TOKEN`
-   - `REMINDER_MINUTES_BEFORE`
    - `GOOGLE_OAUTH_WEB_CLIENT_ID`, `GOOGLE_OAUTH_WEB_CLIENT_SECRET`, `BASE_URL` (สำหรับ multi-user `/setup`)
    - `GEMINI_API_KEY` (จาก https://aistudio.google.com/apikey)
    - `CRON_SECRET` (สตริงสุ่มที่ตั้งเอง ใช้ป้องกันคนนอกยิง endpoint สรุปแชท)

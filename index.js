@@ -33,8 +33,14 @@ const DRIVE_CONFIG_RANGE = `${DRIVE_CONFIG_SHEET}!A:C`;
 const CHAT_LOG_SHEET = 'ChatLog';
 const CHAT_LOG_RANGE = `${CHAT_LOG_SHEET}!A:E`;
 const GEMINI_MODEL = 'gemini-flash-latest';
-const REMINDER_MINUTES_BEFORE = Number(process.env.REMINDER_MINUTES_BEFORE || 30);
 const BANGKOK_UTC_OFFSET_HOURS = 7;
+
+const REMINDER_LEVELS = [
+  { code: '7d', ms: 7 * 24 * 60 * 60 * 1000, label: '7 วัน' },
+  { code: '1d', ms: 24 * 60 * 60 * 1000, label: '1 วัน' },
+  { code: '1h', ms: 60 * 60 * 1000, label: '1 ชั่วโมง' },
+  { code: '5m', ms: 5 * 60 * 1000, label: '5 นาที' },
+];
 
 async function ensureChatLogSheet() {
   const meta = await sheets.spreadsheets.get({ spreadsheetId: process.env.GOOGLE_SHEET_ID });
@@ -385,7 +391,7 @@ async function handleTextMessage(event) {
 
   await lineClient.replyMessage(event.replyToken, {
     type: 'text',
-    text: `✅ บันทึกนัดหมายแล้ว: ${appointment.label}\nกำหนดการ: ${formatBangkokDateTime(appointment.eventTimeMs)} น.\nจะเตือนล่วงหน้า ${REMINDER_MINUTES_BEFORE} นาทีก่อนถึงเวลา`,
+    text: `✅ บันทึกนัดหมายแล้ว: ${appointment.label}\nกำหนดการ: ${formatBangkokDateTime(appointment.eventTimeMs)} น.\nจะเตือนล่วงหน้า ${REMINDER_LEVELS.map((l) => l.label).join(', ')} ก่อนถึงเวลา`,
   });
 }
 
@@ -408,25 +414,36 @@ async function checkReminders() {
   });
   const rows = res.data.values || [];
   const now = Date.now();
-  const reminderWindowMs = REMINDER_MINUTES_BEFORE * 60 * 1000;
 
   for (let i = 0; i < rows.length; i++) {
-    const [groupId, eventTimeIso, label, reminded] = rows[i];
-    if (!eventTimeIso || reminded === 'TRUE') continue;
+    const [groupId, eventTimeIso, label, remindersSentRaw] = rows[i];
+    if (!eventTimeIso) continue;
 
     const eventTimeMs = new Date(eventTimeIso).getTime();
-    if (now >= eventTimeMs - reminderWindowMs) {
+    if (now >= eventTimeMs) continue;
+
+    const remindersSent = (remindersSentRaw || '').split(',').filter(Boolean);
+    let changed = false;
+    for (const level of REMINDER_LEVELS) {
+      if (remindersSent.includes(level.code)) continue;
+      if (now < eventTimeMs - level.ms) continue;
+
       await lineClient.pushMessage(groupId, {
         type: 'text',
-        text: `⏰ เตือนความจำ: ${label}\nกำหนดการ: ${formatBangkokDateTime(eventTimeMs)} น.`,
+        text: `⏰ เตือนความจำ (อีก${level.label}ถึงเวลานัด): ${label}\nกำหนดการ: ${formatBangkokDateTime(eventTimeMs)} น.`,
       });
+      remindersSent.push(level.code);
+      changed = true;
+      console.log(`Reminded "${label}" (${level.code}) in group ${groupId}`);
+    }
+
+    if (changed) {
       await sheets.spreadsheets.values.update({
         spreadsheetId: process.env.GOOGLE_SHEET_ID,
         range: `${SHEET_NAME}!D${i + 1}`,
         valueInputOption: 'RAW',
-        requestBody: { values: [['TRUE']] },
+        requestBody: { values: [[remindersSent.join(',')]] },
       });
-      console.log(`Reminded "${label}" in group ${groupId}`);
     }
   }
 }
