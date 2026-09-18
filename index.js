@@ -131,17 +131,26 @@ async function summarizeChat(transcript) {
 
   const maxAttempts = 3;
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    const res = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`,
-      {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'X-goog-api-key': process.env.GEMINI_API_KEY,
-        },
-        body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] }),
-      }
-    );
+    let res;
+    try {
+      res = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-goog-api-key': process.env.GEMINI_API_KEY,
+          },
+          body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] }),
+          signal: AbortSignal.timeout(20000),
+        }
+      );
+    } catch (err) {
+      if (attempt === maxAttempts) throw new Error(`Gemini request failed: ${err.message}`);
+      await sleep(2000 * attempt);
+      continue;
+    }
+
     if (res.ok) {
       const data = await res.json();
       return data.candidates[0].content.parts[0].text;
@@ -527,17 +536,18 @@ app.get('/cron/daily-summary', async (req, res) => {
       byGroup.get(groupId).push(`${senderName}: ${text}`);
     }
 
-    const results = [];
-    for (const [groupId, lines] of byGroup) {
-      try {
-        const summary = await summarizeChat(lines.join('\n'));
-        await lineClient.pushMessage(groupId, { type: 'text', text: `📋 สรุปแชทวันนี้\n\n${summary}` });
-        results.push({ groupId, status: 'ok', summary });
-      } catch (err) {
-        console.error(`Failed to summarize group ${groupId}:`, err);
-        results.push({ groupId, status: 'error', message: err.message });
-      }
-    }
+    const results = await Promise.all(
+      Array.from(byGroup, async ([groupId, lines]) => {
+        try {
+          const summary = await summarizeChat(lines.join('\n'));
+          await lineClient.pushMessage(groupId, { type: 'text', text: `📋 สรุปแชทวันนี้\n\n${summary}` });
+          return { groupId, status: 'ok', summary };
+        } catch (err) {
+          console.error(`Failed to summarize group ${groupId}:`, err);
+          return { groupId, status: 'error', message: err.message };
+        }
+      })
+    );
 
     await sheets.spreadsheets.values.clear({
       spreadsheetId: process.env.GOOGLE_SHEET_ID,
