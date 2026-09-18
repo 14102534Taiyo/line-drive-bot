@@ -391,7 +391,7 @@ async function handleTextMessage(event) {
 
   await lineClient.replyMessage(event.replyToken, {
     type: 'text',
-    text: `✅ บันทึกนัดหมายแล้ว: ${appointment.label}\n📅 ${formatBangkokDateTime(appointment.eventTimeMs)} น. (เตือน 7วัน/1วัน/1ชม./5นาทีก่อนถึง)`,
+    text: `✅ บันทึกนัดหมายแล้ว: ${appointment.label}\n📅 ${formatBangkokDateTime(appointment.eventTimeMs)} น.`,
   });
 }
 
