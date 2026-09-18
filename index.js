@@ -94,16 +94,24 @@ function describeMessage(message) {
   }
 }
 
+let chatLogBuffer = [];
+
 async function logChatMessage(event) {
   const groupId = event.source.groupId || event.source.userId;
   const senderName = await getSenderName(event.source);
+  chatLogBuffer.push([groupId, new Date().toISOString(), senderName, event.message.type, describeMessage(event.message)]);
+}
+
+async function flushChatLogBuffer() {
+  if (chatLogBuffer.length === 0) return;
+  const rows = chatLogBuffer;
+  chatLogBuffer = [];
+
   await sheets.spreadsheets.values.append({
     spreadsheetId: process.env.GOOGLE_SHEET_ID,
     range: CHAT_LOG_RANGE,
     valueInputOption: 'RAW',
-    requestBody: {
-      values: [[groupId, new Date().toISOString(), senderName, event.message.type, describeMessage(event.message)]],
-    },
+    requestBody: { values: rows },
   });
 }
 
@@ -466,6 +474,8 @@ app.get('/cron/daily-summary', async (req, res) => {
   if (req.query.secret !== process.env.CRON_SECRET) return res.sendStatus(401);
 
   try {
+    await flushChatLogBuffer();
+
     const result = await sheets.spreadsheets.values.get({
       spreadsheetId: process.env.GOOGLE_SHEET_ID,
       range: CHAT_LOG_RANGE,
@@ -508,3 +518,7 @@ ensureChatLogSheet().catch((err) => console.error('Failed to ensure ChatLog shee
 setInterval(() => {
   checkReminders().catch((err) => console.error('Reminder check failed:', err));
 }, 60 * 1000);
+
+setInterval(() => {
+  flushChatLogBuffer().catch((err) => console.error('flushChatLogBuffer failed:', err));
+}, 30 * 1000);
