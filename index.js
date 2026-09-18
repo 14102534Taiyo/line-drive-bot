@@ -355,8 +355,16 @@ async function handleTextMessage(event) {
     return;
   }
 
+  if (!text.startsWith('/นัด')) return;
+
   const appointment = parseAppointment(text);
-  if (!appointment) return;
+  if (!appointment) {
+    await lineClient.replyMessage(event.replyToken, {
+      type: 'text',
+      text: 'รูปแบบไม่ถูกต้องครับ ใช้แบบนี้:\n/นัด วันเดือนปี ชั่วโมง.นาที ข้อความ\nเช่น /นัด 17092026 14.00 สอบ CFO',
+    });
+    return;
+  }
 
   if (appointment.eventTimeMs <= Date.now()) {
     await lineClient.replyMessage(event.replyToken, {
