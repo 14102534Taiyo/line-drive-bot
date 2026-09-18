@@ -13,6 +13,8 @@
 ```
 รูปแบบ: `/นัด วันเดือนปี(ไม่มีขีด) ชั่วโมง.นาที ข้อความ` — บอทเตือนล่วงหน้า `REMINDER_MINUTES_BEFORE` นาที (ค่าเริ่มต้น 30)
 
+**สรุปแชทรายวัน:** ทุกข้อความในกลุ่มถูกบันทึกลง Google Sheet แท็บ `ChatLog` แบบ real-time แล้วมี endpoint `GET /cron/daily-summary?secret=...` ให้ cron ภายนอกยิงมาทุกวันตามเวลาที่ตั้งไว้ — บอทจะสรุปแยกตามกลุ่ม (ใช้ Gemini API) ส่งกลับเข้ากลุ่ม แล้วล้าง log ของวันนั้นทิ้ง กลุ่มที่ไม่มีข้อความจะถูกข้ามอัตโนมัติ
+
 ---
 
 ## ขั้นตอนที่ 1: สร้าง LINE Messaging API Channel
@@ -112,13 +114,29 @@ git commit -m "Add LINE Drive bot"
    - `GOOGLE_OAUTH_CLIENT_SECRET`
    - `GOOGLE_OAUTH_REFRESH_TOKEN`
    - `REMINDER_MINUTES_BEFORE`
+   - `GOOGLE_OAUTH_WEB_CLIENT_ID`, `GOOGLE_OAUTH_WEB_CLIENT_SECRET`, `BASE_URL` (สำหรับ multi-user `/setup`)
+   - `GEMINI_API_KEY` (จาก https://aistudio.google.com/apikey)
+   - `CRON_SECRET` (สตริงสุ่มที่ตั้งเอง ใช้ป้องกันคนนอกยิง endpoint สรุปแชท)
 5. กด **Create Web Service** รอ deploy เสร็จ จะได้ URL ถาวร เช่น `https://line-drive-bot.onrender.com`
 6. กลับไปที่ LINE Developers Console → เปลี่ยน **Webhook URL** เป็น `https://line-drive-bot.onrender.com/webhook` → กด **Verify**
 
-## ขั้นตอนที่ 7: ใช้งานจริง
+## ขั้นตอนที่ 7: ตั้ง cron ปลุก/สรุปแชทรายวัน
+
+Render แผนฟรีจะ sleep เมื่อไม่มีคนใช้งาน ทำให้ scheduler ภายใน (`setInterval`) หยุดทำงานไปด้วย — ฟีเจอร์เตือนนัดหมายและสรุปแชทรายวันจึงต้องพึ่ง cron ภายนอกมาปลุก/สั่งงานแทน:
+
+1. ไปที่ https://cron-job.org (หรือบริการ cron ฟรีอื่น) สมัครบัญชี
+2. สร้าง cronjob ใหม่ → URL:
+   ```
+   https://line-drive-bot-4dt6.onrender.com/cron/daily-summary?secret=<ค่า CRON_SECRET>
+   ```
+3. ตั้งเวลาให้รันทุกวันตามเวลาที่ต้องการ (เช่น 20:00 น. เวลาไทย = 13:00 UTC)
+4. (ถ้าต้องการกันเซิร์ฟเวอร์หลับระหว่างวันด้วย) ตั้ง cronjob อีกตัวยิงไปที่ `https://line-drive-bot-4dt6.onrender.com/` ทุก 10 นาที เพื่อช่วยให้ webhook/reminder ตอบสนองไวขึ้น
+
+## ขั้นตอนที่ 8: ใช้งานจริง
 
 เชิญบอทเข้ากลุ่ม LINE ที่ต้องการเก็บไฟล์ → ทุกครั้งที่มีคนส่งรูปภาพหรือไฟล์ PDF ในกลุ่ม ไฟล์จะถูกอัปโหลดเข้าโฟลเดอร์ Google Drive ที่ตั้งไว้โดยอัตโนมัติ
 
 ### หมายเหตุ
 - ไฟล์ประเภท `file` (เช่น PDF) LINE รองรับเฉพาะที่ส่งจากแอปมือถือเท่านั้น ส่งจาก LINE บน PC จะไม่ใช่ประเภทนี้
-- แผน Free ของ Render จะ sleep เมื่อไม่มีการใช้งาน ทำให้ webhook แรกหลัง sleep อาจช้าไปสักครู่ (cold start) — ถ้าต้องการให้ทำงานทันทีตลอดเวลาต้องอัปเป็นแผนเสียเงิน
+- แผน Free ของ Render จะ sleep เมื่อไม่มีการใช้งาน ทำให้ webhook แรกหลัง sleep อาจช้าไปสักครู่ (cold start) — ถ้าต้องการให้ทำงานทันทีตลอดเวลาต้องอัปเป็นแผนเสียเงิน หรือตั้ง cron ปลุกตามขั้นตอนที่ 7
+- ฟีเจอร์สรุปแชทรายวันจะเก็บข้อความของทุกคนในกลุ่มแบบต่อเนื่อง ควรแจ้งสมาชิกกลุ่มให้ทราบก่อนเปิดใช้งานจริง

@@ -30,8 +30,102 @@ const SHEET_NAME = 'ชีต1';
 const SHEET_RANGE = `${SHEET_NAME}!A:D`;
 const DRIVE_CONFIG_SHEET = 'DriveConfig';
 const DRIVE_CONFIG_RANGE = `${DRIVE_CONFIG_SHEET}!A:C`;
+const CHAT_LOG_SHEET = 'ChatLog';
+const CHAT_LOG_RANGE = `${CHAT_LOG_SHEET}!A:E`;
+const GEMINI_MODEL = 'gemini-flash-latest';
 const REMINDER_MINUTES_BEFORE = Number(process.env.REMINDER_MINUTES_BEFORE || 30);
 const BANGKOK_UTC_OFFSET_HOURS = 7;
+
+async function ensureChatLogSheet() {
+  const meta = await sheets.spreadsheets.get({ spreadsheetId: process.env.GOOGLE_SHEET_ID });
+  const exists = meta.data.sheets.some((s) => s.properties.title === CHAT_LOG_SHEET);
+  if (exists) return;
+
+  await sheets.spreadsheets.batchUpdate({
+    spreadsheetId: process.env.GOOGLE_SHEET_ID,
+    requestBody: { requests: [{ addSheet: { properties: { title: CHAT_LOG_SHEET } } }] },
+  });
+  await sheets.spreadsheets.values.update({
+    spreadsheetId: process.env.GOOGLE_SHEET_ID,
+    range: `${CHAT_LOG_SHEET}!A1:E1`,
+    valueInputOption: 'RAW',
+    requestBody: { values: [['groupId', 'timestamp', 'senderName', 'messageType', 'text']] },
+  });
+  console.log('Created ChatLog sheet tab');
+}
+
+const senderNameCache = new Map();
+
+async function getSenderName(source) {
+  const key = `${source.groupId || 'user'}:${source.userId}`;
+  if (senderNameCache.has(key)) return senderNameCache.get(key);
+
+  let name = source.userId;
+  try {
+    const profile = source.groupId
+      ? await lineClient.getGroupMemberProfile(source.groupId, source.userId)
+      : await lineClient.getProfile(source.userId);
+    name = profile.displayName;
+  } catch {
+    // ดึงชื่อไม่ได้ ใช้ userId แทน
+  }
+  senderNameCache.set(key, name);
+  return name;
+}
+
+function describeMessage(message) {
+  switch (message.type) {
+    case 'text':
+      return message.text;
+    case 'image':
+      return '[รูปภาพ]';
+    case 'file':
+      return `[ไฟล์: ${message.fileName}]`;
+    case 'sticker':
+      return '[สติกเกอร์]';
+    case 'video':
+      return '[วิดีโอ]';
+    case 'audio':
+      return '[ข้อความเสียง]';
+    case 'location':
+      return `[ตำแหน่ง: ${message.title || ''}]`;
+    default:
+      return `[${message.type}]`;
+  }
+}
+
+async function logChatMessage(event) {
+  const groupId = event.source.groupId || event.source.userId;
+  const senderName = await getSenderName(event.source);
+  await sheets.spreadsheets.values.append({
+    spreadsheetId: process.env.GOOGLE_SHEET_ID,
+    range: CHAT_LOG_RANGE,
+    valueInputOption: 'RAW',
+    requestBody: {
+      values: [[groupId, new Date().toISOString(), senderName, event.message.type, describeMessage(event.message)]],
+    },
+  });
+}
+
+async function summarizeChat(transcript) {
+  const prompt = `สรุปบทสนทนากลุ่ม LINE ต่อไปนี้เป็นภาษาไทย โดยแยกเป็นหัวข้อตามประเด็นที่คุยกัน (ใช้หัวข้อสั้นๆ นำหน้าแต่ละประเด็น ตามด้วย bullet สรุปใจความสำคัญ) กระชับ ไม่ต้องทักทายหรือลงท้าย:\n\n${transcript}`;
+
+  const res = await fetch(
+    `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`,
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-goog-api-key': process.env.GEMINI_API_KEY,
+      },
+      body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] }),
+    }
+  );
+  if (!res.ok) throw new Error(`Gemini API error ${res.status}: ${await res.text()}`);
+
+  const data = await res.json();
+  return data.candidates[0].content.parts[0].text;
+}
 
 async function ensureDriveConfigSheet() {
   const meta = await sheets.spreadsheets.get({ spreadsheetId: process.env.GOOGLE_SHEET_ID });
@@ -267,6 +361,8 @@ async function handleTextMessage(event) {
 
 async function handleEvent(event) {
   if (event.type !== 'message') return;
+  await logChatMessage(event).catch((err) => console.error('logChatMessage failed:', err));
+
   const { message } = event;
   if (message.type === 'image' || message.type === 'file') {
     await handleFileMessage(message, event.source);
@@ -366,10 +462,48 @@ app.get('/oauth2callback', async (req, res) => {
   }
 });
 
+app.get('/cron/daily-summary', async (req, res) => {
+  if (req.query.secret !== process.env.CRON_SECRET) return res.sendStatus(401);
+
+  try {
+    const result = await sheets.spreadsheets.values.get({
+      spreadsheetId: process.env.GOOGLE_SHEET_ID,
+      range: CHAT_LOG_RANGE,
+    });
+    const rows = (result.data.values || []).slice(1);
+
+    const byGroup = new Map();
+    for (const [groupId, , senderName, , text] of rows) {
+      if (!byGroup.has(groupId)) byGroup.set(groupId, []);
+      byGroup.get(groupId).push(`${senderName}: ${text}`);
+    }
+
+    for (const [groupId, lines] of byGroup) {
+      try {
+        const summary = await summarizeChat(lines.join('\n'));
+        await lineClient.pushMessage(groupId, { type: 'text', text: `📋 สรุปแชทวันนี้\n\n${summary}` });
+      } catch (err) {
+        console.error(`Failed to summarize group ${groupId}:`, err);
+      }
+    }
+
+    await sheets.spreadsheets.values.clear({
+      spreadsheetId: process.env.GOOGLE_SHEET_ID,
+      range: `${CHAT_LOG_SHEET}!A2:E100000`,
+    });
+
+    res.send(`Summarized ${byGroup.size} group(s)`);
+  } catch (err) {
+    console.error('daily-summary failed:', err);
+    res.sendStatus(500);
+  }
+});
+
 const port = process.env.PORT || 3000;
 app.listen(port, () => console.log(`Listening on port ${port}`));
 
 ensureDriveConfigSheet().catch((err) => console.error('Failed to ensure DriveConfig sheet:', err));
+ensureChatLogSheet().catch((err) => console.error('Failed to ensure ChatLog sheet:', err));
 
 setInterval(() => {
   checkReminders().catch((err) => console.error('Reminder check failed:', err));
