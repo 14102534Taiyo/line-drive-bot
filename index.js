@@ -549,12 +549,17 @@ app.get('/cron/daily-summary', async (req, res) => {
       })
     );
 
-    await sheets.spreadsheets.values.clear({
-      spreadsheetId: process.env.GOOGLE_SHEET_ID,
-      range: `${CHAT_LOG_SHEET}!A2:E100000`,
-    });
+    const allSucceeded = results.every((r) => r.status === 'ok');
+    if (allSucceeded) {
+      await sheets.spreadsheets.values.clear({
+        spreadsheetId: process.env.GOOGLE_SHEET_ID,
+        range: `${CHAT_LOG_SHEET}!A2:E100000`,
+      });
+    } else {
+      console.error('Skipping ChatLog clear because at least one group failed to summarize');
+    }
 
-    res.json({ groupsProcessed: byGroup.size, results });
+    res.json({ groupsProcessed: byGroup.size, cleared: allSucceeded, results });
   } catch (err) {
     console.error('daily-summary failed:', err);
     res.sendStatus(500);
