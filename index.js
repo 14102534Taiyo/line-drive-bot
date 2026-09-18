@@ -115,24 +115,37 @@ async function flushChatLogBuffer() {
   });
 }
 
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 async function summarizeChat(transcript) {
   const prompt = `สรุปบทสนทนากลุ่ม LINE ต่อไปนี้เป็นภาษาไทย โดยแยกเป็นหัวข้อตามประเด็นที่คุยกัน (ใช้หัวข้อสั้นๆ นำหน้าแต่ละประเด็น ตามด้วย bullet สรุปใจความสำคัญ) กระชับ ไม่ต้องทักทายหรือลงท้าย:\n\n${transcript}`;
 
-  const res = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`,
-    {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'X-goog-api-key': process.env.GEMINI_API_KEY,
-      },
-      body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] }),
+  const maxAttempts = 3;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const res = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-goog-api-key': process.env.GEMINI_API_KEY,
+        },
+        body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] }),
+      }
+    );
+    if (res.ok) {
+      const data = await res.json();
+      return data.candidates[0].content.parts[0].text;
     }
-  );
-  if (!res.ok) throw new Error(`Gemini API error ${res.status}: ${await res.text()}`);
 
-  const data = await res.json();
-  return data.candidates[0].content.parts[0].text;
+    const retriable = res.status === 503 || res.status === 429;
+    if (!retriable || attempt === maxAttempts) {
+      throw new Error(`Gemini API error ${res.status}: ${await res.text()}`);
+    }
+    await sleep(2000 * attempt);
+  }
 }
 
 async function ensureDriveConfigSheet() {
