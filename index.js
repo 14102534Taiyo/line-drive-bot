@@ -507,7 +507,7 @@ app.get('/cron/daily-summary', async (req, res) => {
       try {
         const summary = await summarizeChat(lines.join('\n'));
         await lineClient.pushMessage(groupId, { type: 'text', text: `📋 สรุปแชทวันนี้\n\n${summary}` });
-        results.push({ groupId, status: 'ok' });
+        results.push({ groupId, status: 'ok', summary });
       } catch (err) {
         console.error(`Failed to summarize group ${groupId}:`, err);
         results.push({ groupId, status: 'error', message: err.message });
