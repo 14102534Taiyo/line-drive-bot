@@ -47,6 +47,7 @@ There's no timezone library. Bangkok is treated as a fixed UTC+7 offset (`BANGKO
 
 - `/setup` — replies with a personalized link (`buildSetupUrl`) to start the multi-user Drive OAuth flow for that group/user.
 - `/นัด DDMMYYYY HH.MM <label>` — strict regex format (`APPOINTMENT_COMMAND`); an unrecognized `/นัด...` prefix now replies with a usage hint rather than failing silently.
+- `/สรุป` — on-demand version of `/cron/daily-summary` scoped to just the calling group (`summarizeAndConsumeGroup`): summarizes and removes only that group's rows from `ChatLog`, leaving other groups' buffered messages untouched.
 
 Everything else falls through `handleEvent()` untouched (still logged to `ChatLog`, but no reply).
 

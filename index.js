@@ -164,6 +164,37 @@ async function summarizeChat(transcript) {
   }
 }
 
+async function summarizeAndConsumeGroup(groupId) {
+  await flushChatLogBuffer();
+
+  const result = await sheets.spreadsheets.values.get({
+    spreadsheetId: process.env.GOOGLE_SHEET_ID,
+    range: CHAT_LOG_RANGE,
+  });
+  const rows = (result.data.values || []).slice(1);
+  const groupRows = rows.filter((r) => r[0] === groupId);
+  if (groupRows.length === 0) return null;
+
+  const lines = groupRows.map(([, , senderName, , text]) => `${senderName}: ${text}`);
+  const summary = await summarizeChat(lines.join('\n'));
+
+  const otherRows = rows.filter((r) => r[0] !== groupId);
+  await sheets.spreadsheets.values.clear({
+    spreadsheetId: process.env.GOOGLE_SHEET_ID,
+    range: `${CHAT_LOG_SHEET}!A2:E100000`,
+  });
+  if (otherRows.length > 0) {
+    await sheets.spreadsheets.values.update({
+      spreadsheetId: process.env.GOOGLE_SHEET_ID,
+      range: `${CHAT_LOG_SHEET}!A2`,
+      valueInputOption: 'RAW',
+      requestBody: { values: otherRows },
+    });
+  }
+
+  return summary;
+}
+
 async function ensureDriveConfigSheet() {
   const meta = await sheets.spreadsheets.get({ spreadsheetId: process.env.GOOGLE_SHEET_ID });
   const exists = meta.data.sheets.some((s) => s.properties.title === DRIVE_CONFIG_SHEET);
@@ -367,6 +398,24 @@ async function handleTextMessage(event) {
       type: 'text',
       text: `เชื่อมต่อ Google Drive ของคุณเองได้ที่ลิงก์นี้ (login ด้วย Google แล้วกด Allow):\n${buildSetupUrl(groupOrUserId)}`,
     });
+    return;
+  }
+
+  if (text === '/สรุป') {
+    await lineClient.replyMessage(event.replyToken, {
+      type: 'text',
+      text: 'กำลังสรุปให้ครับ รอสักครู่...',
+    });
+    try {
+      const summary = await summarizeAndConsumeGroup(groupOrUserId);
+      await lineClient.pushMessage(groupOrUserId, {
+        type: 'text',
+        text: summary ? `📋 สรุปแชท\n\n${summary}` : 'ยังไม่มีข้อความให้สรุปเลยครับ',
+      });
+    } catch (err) {
+      console.error('On-demand summary failed:', err);
+      await lineClient.pushMessage(groupOrUserId, { type: 'text', text: 'สรุปไม่สำเร็จ ลองใหม่อีกครั้งครับ' });
+    }
     return;
   }
 
