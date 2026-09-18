@@ -488,12 +488,15 @@ app.get('/cron/daily-summary', async (req, res) => {
       byGroup.get(groupId).push(`${senderName}: ${text}`);
     }
 
+    const results = [];
     for (const [groupId, lines] of byGroup) {
       try {
         const summary = await summarizeChat(lines.join('\n'));
         await lineClient.pushMessage(groupId, { type: 'text', text: `📋 สรุปแชทวันนี้\n\n${summary}` });
+        results.push({ groupId, status: 'ok' });
       } catch (err) {
         console.error(`Failed to summarize group ${groupId}:`, err);
+        results.push({ groupId, status: 'error', message: err.message });
       }
     }
 
@@ -502,7 +505,7 @@ app.get('/cron/daily-summary', async (req, res) => {
       range: `${CHAT_LOG_SHEET}!A2:E100000`,
     });
 
-    res.send(`Summarized ${byGroup.size} group(s)`);
+    res.json({ groupsProcessed: byGroup.size, results });
   } catch (err) {
     console.error('daily-summary failed:', err);
     res.sendStatus(500);
