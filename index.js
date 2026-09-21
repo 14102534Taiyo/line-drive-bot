@@ -551,10 +551,6 @@ async function handleTextMessage(event) {
   }
 
   if (text === '/สรุป') {
-    await lineClient.replyMessage(event.replyToken, {
-      type: 'text',
-      text: 'กำลังสรุปให้ครับ รอสักครู่...',
-    });
     try {
       const summary = await summarizeGroupSinceLastRun(groupOrUserId);
       await lineClient.pushMessage(groupOrUserId, {
@@ -577,7 +573,6 @@ async function handleTextMessage(event) {
       });
       return;
     }
-    await lineClient.replyMessage(event.replyToken, { type: 'text', text: 'กำลังหาคำตอบครับ รอสักครู่...' });
     try {
       const answer = await answerQuestion(groupOrUserId, question);
       await lineClient.pushMessage(groupOrUserId, { type: 'text', text: answer });
