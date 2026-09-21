@@ -32,8 +32,12 @@ const DRIVE_CONFIG_SHEET = 'DriveConfig';
 const DRIVE_CONFIG_RANGE = `${DRIVE_CONFIG_SHEET}!A:C`;
 const CHAT_LOG_SHEET = 'ChatLog';
 const CHAT_LOG_RANGE = `${CHAT_LOG_SHEET}!A:E`;
+const CHAT_LOG_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
+const SUMMARY_STATE_SHEET = 'SummaryState';
+const SUMMARY_STATE_RANGE = `${SUMMARY_STATE_SHEET}!A:B`;
 const GEMINI_MODEL = 'gemini-flash-latest';
 const BANGKOK_UTC_OFFSET_HOURS = 7;
+const pendingAppointments = new Map();
 
 const REMINDER_LEVELS = [
   { code: '7d', ms: 7 * 24 * 60 * 60 * 1000, label: '7 วัน' },
@@ -58,6 +62,84 @@ async function ensureChatLogSheet() {
     requestBody: { values: [['groupId', 'timestamp', 'senderName', 'messageType', 'text']] },
   });
   console.log('Created ChatLog sheet tab');
+}
+
+async function ensureSummaryStateSheet() {
+  const meta = await sheets.spreadsheets.get({ spreadsheetId: process.env.GOOGLE_SHEET_ID });
+  const exists = meta.data.sheets.some((s) => s.properties.title === SUMMARY_STATE_SHEET);
+  if (exists) return;
+
+  await sheets.spreadsheets.batchUpdate({
+    spreadsheetId: process.env.GOOGLE_SHEET_ID,
+    requestBody: { requests: [{ addSheet: { properties: { title: SUMMARY_STATE_SHEET } } }] },
+  });
+  await sheets.spreadsheets.values.update({
+    spreadsheetId: process.env.GOOGLE_SHEET_ID,
+    range: `${SUMMARY_STATE_SHEET}!A1:B1`,
+    valueInputOption: 'RAW',
+    requestBody: { values: [['groupId', 'lastSummarizedAt']] },
+  });
+  console.log('Created SummaryState sheet tab');
+}
+
+async function getLastSummarizedAt(groupId) {
+  const res = await sheets.spreadsheets.values.get({
+    spreadsheetId: process.env.GOOGLE_SHEET_ID,
+    range: SUMMARY_STATE_RANGE,
+  });
+  const rows = res.data.values || [];
+  const row = rows.find((r) => r[0] === groupId);
+  return row ? row[1] : null;
+}
+
+async function setLastSummarizedAt(groupId, iso) {
+  const res = await sheets.spreadsheets.values.get({
+    spreadsheetId: process.env.GOOGLE_SHEET_ID,
+    range: SUMMARY_STATE_RANGE,
+  });
+  const rows = res.data.values || [];
+  const rowIndex = rows.findIndex((r) => r[0] === groupId);
+
+  if (rowIndex === -1) {
+    await sheets.spreadsheets.values.append({
+      spreadsheetId: process.env.GOOGLE_SHEET_ID,
+      range: SUMMARY_STATE_RANGE,
+      valueInputOption: 'RAW',
+      requestBody: { values: [[groupId, iso]] },
+    });
+  } else {
+    await sheets.spreadsheets.values.update({
+      spreadsheetId: process.env.GOOGLE_SHEET_ID,
+      range: `${SUMMARY_STATE_SHEET}!B${rowIndex + 1}`,
+      valueInputOption: 'RAW',
+      requestBody: { values: [[iso]] },
+    });
+  }
+}
+
+async function pruneOldChatLog() {
+  const result = await sheets.spreadsheets.values.get({
+    spreadsheetId: process.env.GOOGLE_SHEET_ID,
+    range: CHAT_LOG_RANGE,
+  });
+  const rows = (result.data.values || []).slice(1);
+  const cutoff = Date.now() - CHAT_LOG_RETENTION_MS;
+  const kept = rows.filter((r) => new Date(r[1]).getTime() >= cutoff);
+  if (kept.length === rows.length) return;
+
+  await sheets.spreadsheets.values.clear({
+    spreadsheetId: process.env.GOOGLE_SHEET_ID,
+    range: `${CHAT_LOG_SHEET}!A2:E100000`,
+  });
+  if (kept.length > 0) {
+    await sheets.spreadsheets.values.update({
+      spreadsheetId: process.env.GOOGLE_SHEET_ID,
+      range: `${CHAT_LOG_SHEET}!A2`,
+      valueInputOption: 'RAW',
+      requestBody: { values: kept },
+    });
+  }
+  console.log(`Pruned ChatLog: kept ${kept.length}/${rows.length} rows`);
 }
 
 const senderNameCache = new Map();
@@ -119,16 +201,15 @@ async function flushChatLogBuffer() {
     valueInputOption: 'RAW',
     requestBody: { values: rows },
   });
+
+  detectAppointmentsInBatch(rows).catch((err) => console.error('detectAppointmentsInBatch failed:', err));
 }
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function summarizeChat(transcript) {
-  const todayStr = formatBangkokDateTime(Date.now()).split(' ')[0];
-  const prompt = `วันนี้คือวันที่ ${todayStr} (เวลาไทย) สรุปบทสนทนากลุ่ม LINE ต่อไปนี้เป็นภาษาไทย โดยแยกเป็นหัวข้อตามประเด็นที่คุยกัน (ใช้หัวข้อสั้นๆ นำหน้าแต่ละประเด็น ตามด้วย bullet สรุปใจความสำคัญ) ถ้ามีการพูดถึงวันเวลานัดหมายหรือกำหนดการแบบสัมพัทธ์ (เช่น "พรุ่งนี้", "มะรืนนี้", "จันทร์หน้า") ให้แปลงเป็นวันที่จริงกำกับไว้ในสรุปด้วย กระชับ ไม่ต้องทักทายหรือลงท้าย:\n\n${transcript}`;
-
+async function callGemini(requestBody) {
   const maxAttempts = 3;
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     let res;
@@ -141,7 +222,7 @@ async function summarizeChat(transcript) {
             'Content-Type': 'application/json',
             'X-goog-api-key': process.env.GEMINI_API_KEY,
           },
-          body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] }),
+          body: JSON.stringify(requestBody),
           signal: AbortSignal.timeout(20000),
         }
       );
@@ -164,35 +245,103 @@ async function summarizeChat(transcript) {
   }
 }
 
-async function summarizeAndConsumeGroup(groupId) {
+async function summarizeChat(transcript) {
+  const todayStr = formatBangkokDateTime(Date.now()).split(' ')[0];
+  const prompt = `วันนี้คือวันที่ ${todayStr} (เวลาไทย) สรุปบทสนทนากลุ่ม LINE ต่อไปนี้เป็นภาษาไทย โดยแยกเป็นหัวข้อตามประเด็นที่คุยกัน (ใช้หัวข้อสั้นๆ นำหน้าแต่ละประเด็น ตามด้วย bullet สรุปใจความสำคัญ) ถ้ามีการพูดถึงวันเวลานัดหมายหรือกำหนดการแบบสัมพัทธ์ (เช่น "พรุ่งนี้", "มะรืนนี้", "จันทร์หน้า") ให้แปลงเป็นวันที่จริงกำกับไว้ในสรุปด้วย กระชับ ไม่ต้องทักทายหรือลงท้าย:\n\n${transcript}`;
+  return callGemini({ contents: [{ parts: [{ text: prompt }] }] });
+}
+
+function parseThaiDateTime(dateStr, timeStr) {
+  const [day, month, year] = dateStr.split('/').map(Number);
+  const [hour, minute] = timeStr.split(':').map(Number);
+  return Date.UTC(year, month - 1, day, hour - BANGKOK_UTC_OFFSET_HOURS, minute);
+}
+
+async function detectAppointment(transcript) {
+  const todayStr = formatBangkokDateTime(Date.now()).split(' ')[0];
+  const prompt = `วันนี้คือวันที่ ${todayStr} (เวลาไทย) อ่านบทสนทนากลุ่ม LINE ต่อไปนี้ แล้วพิจารณาว่ามีการนัดหมาย/นัดเจอ/นัดประชุมกันที่ระบุหรือคำนวณวันเวลาที่ชัดเจนได้หรือไม่ (ต้องเป็นการนัดที่ดูเหมือนตกลงกันแล้วจริงๆ ไม่ใช่แค่ชวนคุยเฉยๆ) ตอบเป็น JSON เท่านั้น ไม่ต้องมีข้อความอื่น:\n- ถ้ามีนัด: {"isAppointment": true, "date": "DD/MM/YYYY", "time": "HH:MM", "label": "หัวข้อสั้นๆ"}\n- ถ้าไม่มี: {"isAppointment": false}\n\nบทสนทนา:\n${transcript}`;
+
+  const raw = await callGemini({
+    contents: [{ parts: [{ text: prompt }] }],
+    generationConfig: { responseMimeType: 'application/json' },
+  });
+
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return { isAppointment: false };
+  }
+}
+
+async function detectAppointmentsInBatch(rows) {
+  const byGroup = new Map();
+  for (const [groupId, , senderName, messageType, text] of rows) {
+    if (messageType !== 'text') continue;
+    if (!byGroup.has(groupId)) byGroup.set(groupId, []);
+    byGroup.get(groupId).push(`${senderName}: ${text}`);
+  }
+
+  await Promise.all(
+    Array.from(byGroup, async ([groupId, lines]) => {
+      if (pendingAppointments.has(groupId)) return;
+      try {
+        const detection = await detectAppointment(lines.join('\n'));
+        if (!detection.isAppointment || !detection.date || !detection.time || !detection.label) return;
+
+        const eventTimeMs = parseThaiDateTime(detection.date, detection.time);
+        if (!Number.isFinite(eventTimeMs) || eventTimeMs <= Date.now()) return;
+
+        pendingAppointments.set(groupId, { label: detection.label, eventTimeMs });
+        await lineClient.pushMessage(groupId, {
+          type: 'text',
+          text: `🤔 ตรวจพบว่าอาจมีการนัดหมาย:\n${detection.label}\n📅 ${formatBangkokDateTime(eventTimeMs)} น.\n\nพิมพ์ "/ยืนยันนัด" เพื่อบันทึกและตั้งเตือน หรือไม่ต้องทำอะไรถ้าไม่ใช่`,
+        });
+      } catch (err) {
+        console.error(`detectAppointment failed for group ${groupId}:`, err);
+      }
+    })
+  );
+}
+
+async function summarizeGroupSinceLastRun(groupId) {
   await flushChatLogBuffer();
 
-  const result = await sheets.spreadsheets.values.get({
-    spreadsheetId: process.env.GOOGLE_SHEET_ID,
-    range: CHAT_LOG_RANGE,
-  });
+  const [result, lastSummarizedAt] = await Promise.all([
+    sheets.spreadsheets.values.get({ spreadsheetId: process.env.GOOGLE_SHEET_ID, range: CHAT_LOG_RANGE }),
+    getLastSummarizedAt(groupId),
+  ]);
+  const sinceMs = lastSummarizedAt ? new Date(lastSummarizedAt).getTime() : 0;
   const rows = (result.data.values || []).slice(1);
-  const groupRows = rows.filter((r) => r[0] === groupId);
+  const groupRows = rows.filter((r) => r[0] === groupId && new Date(r[1]).getTime() > sinceMs);
   if (groupRows.length === 0) return null;
 
   const lines = groupRows.map(([, , senderName, , text]) => `${senderName}: ${text}`);
   const summary = await summarizeChat(lines.join('\n'));
 
-  const otherRows = rows.filter((r) => r[0] !== groupId);
-  await sheets.spreadsheets.values.clear({
-    spreadsheetId: process.env.GOOGLE_SHEET_ID,
-    range: `${CHAT_LOG_SHEET}!A2:E100000`,
-  });
-  if (otherRows.length > 0) {
-    await sheets.spreadsheets.values.update({
-      spreadsheetId: process.env.GOOGLE_SHEET_ID,
-      range: `${CHAT_LOG_SHEET}!A2`,
-      valueInputOption: 'RAW',
-      requestBody: { values: otherRows },
-    });
-  }
-
+  await setLastSummarizedAt(groupId, new Date().toISOString());
   return summary;
+}
+
+async function answerQuestion(groupId, question) {
+  const [chatLogResult, appointmentsResult] = await Promise.all([
+    sheets.spreadsheets.values.get({ spreadsheetId: process.env.GOOGLE_SHEET_ID, range: CHAT_LOG_RANGE }),
+    sheets.spreadsheets.values.get({ spreadsheetId: process.env.GOOGLE_SHEET_ID, range: SHEET_RANGE }),
+  ]);
+
+  const chatRows = (chatLogResult.data.values || []).slice(1).filter((r) => r[0] === groupId);
+  const transcript = chatRows
+    .map(([, timestamp, senderName, , text]) => `[${formatBangkokDateTime(new Date(timestamp).getTime())}] ${senderName}: ${text}`)
+    .join('\n');
+
+  const appointmentRows = (appointmentsResult.data.values || []).filter((r) => r[0] === groupId);
+  const appointmentsText =
+    appointmentRows.map(([, eventTimeIso, label]) => `- ${label} (${formatBangkokDateTime(new Date(eventTimeIso).getTime())} น.)`).join('\n') ||
+    'ไม่มีนัดหมาย';
+
+  const todayStr = formatBangkokDateTime(Date.now()).split(' ')[0];
+  const prompt = `วันนี้คือวันที่ ${todayStr} (เวลาไทย)\n\nนี่คือประวัติแชทของกลุ่ม LINE นี้ (${CHAT_LOG_RETENTION_MS / (24 * 60 * 60 * 1000)} วันล่าสุด):\n${transcript || 'ไม่มีข้อความ'}\n\nรายการนัดหมายที่มีอยู่:\n${appointmentsText}\n\nตอบคำถามต่อไปนี้เป็นภาษาไทย โดยอ้างอิงจากข้อมูลข้างต้นเท่านั้น ถ้าไม่พบข้อมูลที่เกี่ยวข้องให้บอกตรงๆ ว่าไม่พบข้อมูล ห้ามเดา:\n${question}`;
+
+  return callGemini({ contents: [{ parts: [{ text: prompt }] }] });
 }
 
 async function ensureDriveConfigSheet() {
@@ -407,15 +556,55 @@ async function handleTextMessage(event) {
       text: 'กำลังสรุปให้ครับ รอสักครู่...',
     });
     try {
-      const summary = await summarizeAndConsumeGroup(groupOrUserId);
+      const summary = await summarizeGroupSinceLastRun(groupOrUserId);
       await lineClient.pushMessage(groupOrUserId, {
         type: 'text',
-        text: summary ? `📋 สรุปแชท\n\n${summary}` : 'ยังไม่มีข้อความให้สรุปเลยครับ',
+        text: summary ? `📋 สรุปแชท\n\n${summary}` : 'ยังไม่มีข้อความใหม่ให้สรุปเลยครับ',
       });
     } catch (err) {
       console.error('On-demand summary failed:', err);
       await lineClient.pushMessage(groupOrUserId, { type: 'text', text: 'สรุปไม่สำเร็จ ลองใหม่อีกครั้งครับ' });
     }
+    return;
+  }
+
+  if (text.startsWith('/ถาม')) {
+    const question = text.slice('/ถาม'.length).trim();
+    if (!question) {
+      await lineClient.replyMessage(event.replyToken, {
+        type: 'text',
+        text: 'พิมพ์คำถามต่อท้ายด้วยครับ เช่น /ถาม เมื่อกี้คุยเรื่องอะไรกัน',
+      });
+      return;
+    }
+    await lineClient.replyMessage(event.replyToken, { type: 'text', text: 'กำลังหาคำตอบครับ รอสักครู่...' });
+    try {
+      const answer = await answerQuestion(groupOrUserId, question);
+      await lineClient.pushMessage(groupOrUserId, { type: 'text', text: answer });
+    } catch (err) {
+      console.error('answerQuestion failed:', err);
+      await lineClient.pushMessage(groupOrUserId, { type: 'text', text: 'ตอบไม่สำเร็จ ลองใหม่อีกครั้งครับ' });
+    }
+    return;
+  }
+
+  if (text === '/ยืนยันนัด') {
+    const pending = pendingAppointments.get(groupOrUserId);
+    if (!pending) {
+      await lineClient.replyMessage(event.replyToken, { type: 'text', text: 'ไม่มีนัดหมายที่รอยืนยันอยู่ครับ' });
+      return;
+    }
+    await sheets.spreadsheets.values.append({
+      spreadsheetId: process.env.GOOGLE_SHEET_ID,
+      range: SHEET_RANGE,
+      valueInputOption: 'RAW',
+      requestBody: { values: [[groupOrUserId, new Date(pending.eventTimeMs).toISOString(), pending.label, '']] },
+    });
+    pendingAppointments.delete(groupOrUserId);
+    await lineClient.replyMessage(event.replyToken, {
+      type: 'text',
+      text: `✅ บันทึกนัดหมายแล้ว: ${pending.label}\n📅 ${formatBangkokDateTime(pending.eventTimeMs)} น.`,
+    });
     return;
   }
 
@@ -580,16 +769,24 @@ app.get('/cron/daily-summary', async (req, res) => {
     const rows = (result.data.values || []).slice(1);
 
     const byGroup = new Map();
-    for (const [groupId, , senderName, , text] of rows) {
+    for (const row of rows) {
+      const groupId = row[0];
       if (!byGroup.has(groupId)) byGroup.set(groupId, []);
-      byGroup.get(groupId).push(`${senderName}: ${text}`);
+      byGroup.get(groupId).push(row);
     }
 
     const results = await Promise.all(
-      Array.from(byGroup, async ([groupId, lines]) => {
+      Array.from(byGroup, async ([groupId, groupRows]) => {
         try {
+          const lastSummarizedAt = await getLastSummarizedAt(groupId);
+          const sinceMs = lastSummarizedAt ? new Date(lastSummarizedAt).getTime() : 0;
+          const newRows = groupRows.filter((r) => new Date(r[1]).getTime() > sinceMs);
+          if (newRows.length === 0) return { groupId, status: 'skipped' };
+
+          const lines = newRows.map(([, , senderName, , text]) => `${senderName}: ${text}`);
           const summary = await summarizeChat(lines.join('\n'));
           await lineClient.pushMessage(groupId, { type: 'text', text: `📋 สรุปแชทวันนี้\n\n${summary}` });
+          await setLastSummarizedAt(groupId, new Date().toISOString());
           return { groupId, status: 'ok', summary };
         } catch (err) {
           console.error(`Failed to summarize group ${groupId}:`, err);
@@ -598,17 +795,9 @@ app.get('/cron/daily-summary', async (req, res) => {
       })
     );
 
-    const allSucceeded = results.every((r) => r.status === 'ok');
-    if (allSucceeded) {
-      await sheets.spreadsheets.values.clear({
-        spreadsheetId: process.env.GOOGLE_SHEET_ID,
-        range: `${CHAT_LOG_SHEET}!A2:E100000`,
-      });
-    } else {
-      console.error('Skipping ChatLog clear because at least one group failed to summarize');
-    }
+    await pruneOldChatLog();
 
-    res.json({ groupsProcessed: byGroup.size, cleared: allSucceeded, results });
+    res.json({ groupsProcessed: byGroup.size, results });
   } catch (err) {
     console.error('daily-summary failed:', err);
     res.sendStatus(500);
@@ -620,6 +809,7 @@ app.listen(port, () => console.log(`Listening on port ${port}`));
 
 ensureDriveConfigSheet().catch((err) => console.error('Failed to ensure DriveConfig sheet:', err));
 ensureChatLogSheet().catch((err) => console.error('Failed to ensure ChatLog sheet:', err));
+ensureSummaryStateSheet().catch((err) => console.error('Failed to ensure SummaryState sheet:', err));
 
 setInterval(() => {
   checkReminders().catch((err) => console.error('Reminder check failed:', err));
