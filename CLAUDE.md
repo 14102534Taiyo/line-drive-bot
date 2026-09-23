@@ -32,7 +32,9 @@ Service accounts have no Drive storage quota of their own, so a service account 
 
 ### Chat log buffering
 
-Every incoming message (any type) is pushed into an in-memory `chatLogBuffer` array by `logChatMessage()`. A `setInterval` flushes it to the `ChatLog` sheet every 30s as a single batched `append` call (and skips entirely if the buffer is empty) — this exists specifically to avoid burning through the Sheets API's per-minute write quota on a fast-moving group chat. `GET /cron/daily-summary` and `/สรุป` also flush the buffer first before reading, so nothing in flight is missed. After each successful flush, `detectAppointmentsInBatch()` runs (fire-and-forget, errors logged not thrown) over just that batch — see "Appointment auto-detection" below.
+Every incoming message (any type) is pushed into an in-memory `chatLogBuffer` array by `logChatMessage()`. A `setInterval` flushes it to the `ChatLog` sheet every 30s as a single batched `append` call (and skips entirely if the buffer is empty) — this exists specifically to avoid burning through the Sheets API's per-minute write quota on a fast-moving group chat. `GET /cron/daily-summary` and `/สรุป` also flush the buffer first before reading, so nothing in flight is missed.
+
+**Do not call Gemini from this flush path.** An earlier version ran appointment detection here on every 30s flush and blew through the Gemini free tier's **20 requests/day** (per-project, not per-minute — easy to miss) inside a single 10-minute conversation. All Gemini calls now happen only inside the summarize paths (`summarizeGroupSinceLastRun`, `/cron/daily-summary`) — see below.
 
 ### Summarization uses a watermark, not deletion (important: don't reintroduce clearing)
 
@@ -41,7 +43,7 @@ Every incoming message (any type) is pushed into an in-memory `chatLogBuffer` ar
 - `summarizeGroupSinceLastRun(groupId)` — used by `/สรุป`.
 - The `GET /cron/daily-summary` route — used by the external cron; loops every group concurrently (`Promise.all`), and groups with no rows newer than their watermark are reported as `status: 'skipped'` rather than being pushed an empty summary. It also calls `pruneOldChatLog()` once at the end regardless of per-group outcomes, deleting rows older than 30 days — this is independent of the watermark, so a group neglected for over a month will lose its unsummarized backlog. That's an accepted trade-off, not a bug to fix.
 
-Both call `summarizeChat()`, which explicitly tells Gemini today's date (Bangkok time) in the prompt so it can resolve relative references like "พรุ่งนี้" into an actual calendar date in the output — without that, the model has no reference point for "today". `summarizeChat()` and `detectAppointment()` both go through the shared `callGemini(requestBody)` helper (20s-per-attempt timeout via `AbortSignal.timeout`, retry on 503/429/network errors) — add new Gemini call sites through this helper rather than duplicating the retry loop.
+Both call `summarizeAndDetectAppointments(transcript)`, a single Gemini call (JSON response mode) that returns `{summary, appointments}` together — summary and appointment detection used to be two separate Gemini calls (one per flush, see below) until that turned out to burn through the daily quota; folding them into the one call the summarize path already has to make was the fix. It explicitly tells Gemini today's date (Bangkok time) so it can resolve relative references like "พรุ่งนี้" into an actual calendar date. It goes through the shared `callGemini(requestBody)` helper (20s-per-attempt timeout via `AbortSignal.timeout`, retry on 503/429/network errors) — add new Gemini call sites through this helper rather than duplicating the retry loop, and think hard before adding any Gemini call that isn't gated behind an explicit user action or the daily cron, given the 20/day ceiling.
 
 ### Why `/cron/daily-summary` is a route and not just a timer
 
@@ -53,9 +55,7 @@ Render's free tier suspends the whole Node process when idle, which kills in-pro
 
 ### Appointment auto-detection
 
-`detectAppointmentsInBatch(rows)` groups a freshly-flushed batch of `ChatLog` rows by `groupId` and, per group, asks Gemini (`detectAppointment()`, JSON response mode) whether the messages describe an appointment being agreed on, and if so extracts `{date, time, label}`. This runs on every flush that has new text messages, **not** on the full history, so it only ever reacts to the latest chunk of conversation. A detection is **never saved automatically** — it's stashed in the in-memory `pendingAppointments` map (`groupId -> {label, eventTimeMs}`, lost on restart, one pending suggestion per group at a time) and announced in the group; a human must type `/ยืนยันนัด` to actually write it into `ชีต1` (same shape as a manual `/นัด`, with an empty `remindersSent`). This confirm-first behavior was a deliberate choice over auto-saving, to keep false positives from silently creating reminders.
-
-Because this calls Gemini on every 30s flush that has new messages, a chatty group will drive noticeably more Gemini calls than the daily-summary path alone — that's the accepted cost of the feature, not a bug.
+`appointments` is the second field `summarizeAndDetectAppointments()` returns alongside the summary — same Gemini call, no extra request. It only ever sees whatever was summarized (a `/สรุป` call or a daily-cron pass), so it reacts on the same cadence as summarization, not per-message. `announcePendingAppointments(groupId, appointments)` (called from both summarize paths) is what actually surfaces a detection: a match is **never saved automatically** — it's stashed in the in-memory `pendingAppointments` map (`groupId -> {label, eventTimeMs}`, lost on restart, one pending suggestion per group at a time) and announced in the group; a human must type `/ยืนยันนัด` to actually write it into `ชีต1` (same shape as a manual `/นัด`, with an empty `remindersSent`). This confirm-first behavior was a deliberate choice over auto-saving, to keep false positives from silently creating reminders.
 
 ### Timezone handling
 

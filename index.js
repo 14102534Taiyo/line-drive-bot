@@ -201,8 +201,6 @@ async function flushChatLogBuffer() {
     valueInputOption: 'RAW',
     requestBody: { values: rows },
   });
-
-  detectAppointmentsInBatch(rows).catch((err) => console.error('detectAppointmentsInBatch failed:', err));
 }
 
 function sleep(ms) {
@@ -245,21 +243,23 @@ async function callGemini(requestBody) {
   }
 }
 
-async function summarizeChat(transcript) {
-  const todayStr = formatBangkokDateTime(Date.now()).split(' ')[0];
-  const prompt = `วันนี้คือวันที่ ${todayStr} (เวลาไทย) สรุปบทสนทนากลุ่ม LINE ต่อไปนี้เป็นภาษาไทย โดยแยกเป็นหัวข้อตามประเด็นที่คุยกัน (ใช้หัวข้อสั้นๆ นำหน้าแต่ละประเด็น ตามด้วย bullet สรุปใจความสำคัญ) ถ้ามีการพูดถึงวันเวลานัดหมายหรือกำหนดการแบบสัมพัทธ์ (เช่น "พรุ่งนี้", "มะรืนนี้", "จันทร์หน้า") ให้แปลงเป็นวันที่จริงกำกับไว้ในสรุปด้วย กระชับ ไม่ต้องทักทายหรือลงท้าย:\n\n${transcript}`;
-  return callGemini({ contents: [{ parts: [{ text: prompt }] }] });
-}
-
 function parseThaiDateTime(dateStr, timeStr) {
   const [day, month, year] = dateStr.split('/').map(Number);
   const [hour, minute] = timeStr.split(':').map(Number);
   return Date.UTC(year, month - 1, day, hour - BANGKOK_UTC_OFFSET_HOURS, minute);
 }
 
-async function detectAppointment(transcript) {
+async function summarizeAndDetectAppointments(transcript) {
   const todayStr = formatBangkokDateTime(Date.now()).split(' ')[0];
-  const prompt = `วันนี้คือวันที่ ${todayStr} (เวลาไทย) อ่านบทสนทนากลุ่ม LINE ต่อไปนี้ แล้วพิจารณาว่ามีการนัดหมาย/นัดเจอ/นัดประชุมกันที่ระบุหรือคำนวณวันเวลาที่ชัดเจนได้หรือไม่ (ต้องเป็นการนัดที่ดูเหมือนตกลงกันแล้วจริงๆ ไม่ใช่แค่ชวนคุยเฉยๆ) ตอบเป็น JSON เท่านั้น ไม่ต้องมีข้อความอื่น:\n- ถ้ามีนัด: {"isAppointment": true, "date": "DD/MM/YYYY", "time": "HH:MM", "label": "หัวข้อสั้นๆ"}\n- ถ้าไม่มี: {"isAppointment": false}\n\nบทสนทนา:\n${transcript}`;
+  const prompt = `วันนี้คือวันที่ ${todayStr} (เวลาไทย) อ่านบทสนทนากลุ่ม LINE ต่อไปนี้ แล้วตอบเป็น JSON เท่านั้นตามรูปแบบนี้ (ไม่ต้องมีข้อความอื่นนอก JSON):
+{
+  "summary": "สรุปบทสนทนาเป็นภาษาไทย แยกเป็นหัวข้อตามประเด็นที่คุยกัน (หัวข้อสั้นๆ นำหน้าแต่ละประเด็น ตามด้วย bullet สรุปใจความสำคัญ) ถ้ามีการพูดถึงวันเวลาแบบสัมพัทธ์ เช่น พรุ่งนี้ จันทร์หน้า ให้แปลงเป็นวันที่จริงกำกับไว้ด้วย กระชับ ไม่ทักทายไม่ลงท้าย",
+  "appointments": [{"date": "DD/MM/YYYY", "time": "HH:MM", "label": "หัวข้อสั้นๆ"}]
+}
+appointments ใส่เฉพาะรายการที่ดูเหมือนตกลงนัดกันแล้วจริงๆ (ไม่ใช่แค่ชวนคุยเฉยๆ) และระบุ/คำนวณวันเวลาที่ชัดเจนได้เท่านั้น ถ้าไม่มีให้ใส่ array ว่าง []
+
+บทสนทนา:
+${transcript}`;
 
   const raw = await callGemini({
     contents: [{ parts: [{ text: prompt }] }],
@@ -267,40 +267,30 @@ async function detectAppointment(transcript) {
   });
 
   try {
-    return JSON.parse(raw);
+    const parsed = JSON.parse(raw);
+    return {
+      summary: parsed.summary || raw,
+      appointments: Array.isArray(parsed.appointments) ? parsed.appointments : [],
+    };
   } catch {
-    return { isAppointment: false };
+    return { summary: raw, appointments: [] };
   }
 }
 
-async function detectAppointmentsInBatch(rows) {
-  const byGroup = new Map();
-  for (const [groupId, , senderName, messageType, text] of rows) {
-    if (messageType !== 'text') continue;
-    if (!byGroup.has(groupId)) byGroup.set(groupId, []);
-    byGroup.get(groupId).push(`${senderName}: ${text}`);
+async function announcePendingAppointments(groupId, appointments) {
+  for (const appt of appointments) {
+    if (pendingAppointments.has(groupId)) break;
+    if (!appt.date || !appt.time || !appt.label) continue;
+
+    const eventTimeMs = parseThaiDateTime(appt.date, appt.time);
+    if (!Number.isFinite(eventTimeMs) || eventTimeMs <= Date.now()) continue;
+
+    pendingAppointments.set(groupId, { label: appt.label, eventTimeMs });
+    await lineClient.pushMessage(groupId, {
+      type: 'text',
+      text: `🤔 ตรวจพบว่าอาจมีการนัดหมาย:\n${appt.label}\n📅 ${formatBangkokDateTime(eventTimeMs)} น.\n\nพิมพ์ "/ยืนยันนัด" เพื่อบันทึกและตั้งเตือน หรือไม่ต้องทำอะไรถ้าไม่ใช่`,
+    });
   }
-
-  await Promise.all(
-    Array.from(byGroup, async ([groupId, lines]) => {
-      if (pendingAppointments.has(groupId)) return;
-      try {
-        const detection = await detectAppointment(lines.join('\n'));
-        if (!detection.isAppointment || !detection.date || !detection.time || !detection.label) return;
-
-        const eventTimeMs = parseThaiDateTime(detection.date, detection.time);
-        if (!Number.isFinite(eventTimeMs) || eventTimeMs <= Date.now()) return;
-
-        pendingAppointments.set(groupId, { label: detection.label, eventTimeMs });
-        await lineClient.pushMessage(groupId, {
-          type: 'text',
-          text: `🤔 ตรวจพบว่าอาจมีการนัดหมาย:\n${detection.label}\n📅 ${formatBangkokDateTime(eventTimeMs)} น.\n\nพิมพ์ "/ยืนยันนัด" เพื่อบันทึกและตั้งเตือน หรือไม่ต้องทำอะไรถ้าไม่ใช่`,
-        });
-      } catch (err) {
-        console.error(`detectAppointment failed for group ${groupId}:`, err);
-      }
-    })
-  );
 }
 
 async function summarizeGroupSinceLastRun(groupId) {
@@ -316,9 +306,10 @@ async function summarizeGroupSinceLastRun(groupId) {
   if (groupRows.length === 0) return null;
 
   const lines = groupRows.map(([, , senderName, , text]) => `${senderName}: ${text}`);
-  const summary = await summarizeChat(lines.join('\n'));
+  const { summary, appointments } = await summarizeAndDetectAppointments(lines.join('\n'));
 
   await setLastSummarizedAt(groupId, new Date().toISOString());
+  await announcePendingAppointments(groupId, appointments).catch((err) => console.error('announcePendingAppointments failed:', err));
   return summary;
 }
 
@@ -779,9 +770,12 @@ app.get('/cron/daily-summary', async (req, res) => {
           if (newRows.length === 0) return { groupId, status: 'skipped' };
 
           const lines = newRows.map(([, , senderName, , text]) => `${senderName}: ${text}`);
-          const summary = await summarizeChat(lines.join('\n'));
+          const { summary, appointments } = await summarizeAndDetectAppointments(lines.join('\n'));
           await lineClient.pushMessage(groupId, { type: 'text', text: `📋 สรุปแชทวันนี้\n\n${summary}` });
           await setLastSummarizedAt(groupId, new Date().toISOString());
+          await announcePendingAppointments(groupId, appointments).catch((err) =>
+            console.error('announcePendingAppointments failed:', err)
+          );
           return { groupId, status: 'ok', summary };
         } catch (err) {
           console.error(`Failed to summarize group ${groupId}:`, err);
