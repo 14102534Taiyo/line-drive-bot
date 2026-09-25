@@ -35,7 +35,7 @@ const CHAT_LOG_RANGE = `${CHAT_LOG_SHEET}!A:E`;
 const CHAT_LOG_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
 const SUMMARY_STATE_SHEET = 'SummaryState';
 const SUMMARY_STATE_RANGE = `${SUMMARY_STATE_SHEET}!A:B`;
-const GEMINI_MODEL = 'gemini-flash-latest';
+const GEMINI_MODEL = 'gemini-flash-lite-latest';
 const BANGKOK_UTC_OFFSET_HOURS = 7;
 const pendingAppointments = new Map();
 
