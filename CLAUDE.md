@@ -70,6 +70,7 @@ There's no timezone library. Bangkok is treated as a fixed UTC+7 offset (`BANGKO
 - `/สรุป` — on-demand version of `/cron/daily-summary` scoped to just the calling group (`summarizeGroupSinceLastRun`).
 - `/ถาม <question>` — answers from that group's chat history + appointments (`answerQuestion`); replies with a "กำลังหาคำตอบ..." placeholder first since the Gemini call can take a few seconds, then pushes the real answer.
 - `/ยืนยันนัด` — confirms whatever's currently in `pendingAppointments` for that group (see "Appointment auto-detection") and writes it to `ชีต1`.
+- `/นัดทั้งหมด`, `/ยกเลิกนัด <n>`, `/เลื่อนนัด <n> DDMMYYYY HH.MM` — manage existing appointments via `getGroupAppointments(groupId)`, which reads `ชีต1`, keeps only that group's future rows, and sorts by `eventTimeMs`. That sort order **is** the numbering `<n>` refers to — there's no session state, so the same query always produces the same numbering as long as nothing changed in between. Cancel deletes the row outright (`spreadsheets.batchUpdate` `deleteDimension`, via `getAppointmentSheetId()` which caches `ชีต1`'s numeric sheetId); reschedule overwrites `eventTimeIso` in place and resets `remindersSent` to `''` so `checkReminders()` re-fires all levels against the new time.
 
 Everything else falls through `handleEvent()` untouched (still logged to `ChatLog`, but no reply).
 
