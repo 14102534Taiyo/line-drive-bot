@@ -41,9 +41,9 @@ const pendingAppointments = new Map();
 
 const REMINDER_LEVELS = [
   { code: '7d', ms: 7 * 24 * 60 * 60 * 1000, label: '7 วัน' },
+  { code: '3d', ms: 3 * 24 * 60 * 60 * 1000, label: '3 วัน' },
   { code: '1d', ms: 24 * 60 * 60 * 1000, label: '1 วัน' },
   { code: '1h', ms: 60 * 60 * 1000, label: '1 ชั่วโมง' },
-  { code: '5m', ms: 5 * 60 * 1000, label: '5 นาที' },
 ];
 
 async function ensureChatLogSheet() {
