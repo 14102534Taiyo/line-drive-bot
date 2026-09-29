@@ -300,7 +300,7 @@ async function summarizeGroupSinceLastRun(groupId) {
     sheets.spreadsheets.values.get({ spreadsheetId: process.env.GOOGLE_SHEET_ID, range: CHAT_LOG_RANGE }),
     getLastSummarizedAt(groupId),
   ]);
-  const sinceMs = lastSummarizedAt ? new Date(lastSummarizedAt).getTime() : 0;
+  const sinceMs = Math.max(lastSummarizedAt ? new Date(lastSummarizedAt).getTime() : 0, getStartOfTodayBangkokMs());
   const rows = (result.data.values || []).slice(1);
   const groupRows = rows.filter((r) => r[0] === groupId && new Date(r[1]).getTime() > sinceMs);
   if (groupRows.length === 0) return null;
@@ -513,6 +513,17 @@ function formatBangkokDateTime(ms) {
   }).formatToParts(new Date(ms));
   const get = (type) => parts.find((p) => p.type === type).value;
   return `${get('day')}/${get('month')}/${get('year')} ${get('hour')}:${get('minute')}`;
+}
+
+function getStartOfTodayBangkokMs() {
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Asia/Bangkok',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).formatToParts(new Date());
+  const get = (type) => Number(parts.find((p) => p.type === type).value);
+  return Date.UTC(get('year'), get('month') - 1, get('day'), -BANGKOK_UTC_OFFSET_HOURS, 0);
 }
 
 function parseAppointment(text) {
@@ -765,7 +776,7 @@ app.get('/cron/daily-summary', async (req, res) => {
       Array.from(byGroup, async ([groupId, groupRows]) => {
         try {
           const lastSummarizedAt = await getLastSummarizedAt(groupId);
-          const sinceMs = lastSummarizedAt ? new Date(lastSummarizedAt).getTime() : 0;
+          const sinceMs = Math.max(lastSummarizedAt ? new Date(lastSummarizedAt).getTime() : 0, getStartOfTodayBangkokMs());
           const newRows = groupRows.filter((r) => new Date(r[1]).getTime() > sinceMs);
           if (newRows.length === 0) return { groupId, status: 'skipped' };
 
