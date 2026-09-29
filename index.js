@@ -540,6 +540,36 @@ function parseAppointment(text) {
   return { eventTimeMs, label };
 }
 
+const RESCHEDULE_COMMAND = /^\/เลื่อนนัด\s+(\d+)\s+(\d{2})(\d{2})(\d{4})\s+(\d{1,2})\.(\d{2})$/;
+
+let cachedAppointmentSheetId = null;
+
+async function getAppointmentSheetId() {
+  if (cachedAppointmentSheetId !== null) return cachedAppointmentSheetId;
+  const meta = await sheets.spreadsheets.get({ spreadsheetId: process.env.GOOGLE_SHEET_ID });
+  const sheet = meta.data.sheets.find((s) => s.properties.title === SHEET_NAME);
+  cachedAppointmentSheetId = sheet.properties.sheetId;
+  return cachedAppointmentSheetId;
+}
+
+async function getGroupAppointments(groupId) {
+  const res = await sheets.spreadsheets.values.get({ spreadsheetId: process.env.GOOGLE_SHEET_ID, range: SHEET_RANGE });
+  const rows = res.data.values || [];
+  const now = Date.now();
+  const appointments = [];
+
+  for (let i = 1; i < rows.length; i++) {
+    const [rowGroupId, eventTimeIso, label] = rows[i];
+    if (rowGroupId !== groupId || !eventTimeIso) continue;
+    const eventTimeMs = new Date(eventTimeIso).getTime();
+    if (eventTimeMs <= now) continue;
+    appointments.push({ sheetRow: i + 1, label, eventTimeMs });
+  }
+
+  appointments.sort((a, b) => a.eventTimeMs - b.eventTimeMs);
+  return appointments;
+}
+
 async function handleTextMessage(event) {
   const text = event.message.text.trim();
   const groupOrUserId = event.source.groupId || event.source.userId;
@@ -601,6 +631,94 @@ async function handleTextMessage(event) {
     await lineClient.replyMessage(event.replyToken, {
       type: 'text',
       text: `✅ บันทึกนัดหมายแล้ว: ${pending.label}\n📅 ${formatBangkokDateTime(pending.eventTimeMs)} น.`,
+    });
+    return;
+  }
+
+  if (text === '/นัดทั้งหมด') {
+    const appointments = await getGroupAppointments(groupOrUserId);
+    if (appointments.length === 0) {
+      await lineClient.replyMessage(event.replyToken, { type: 'text', text: 'ยังไม่มีนัดหมายที่กำลังจะถึงเลยครับ' });
+      return;
+    }
+    const list = appointments
+      .map((a, i) => `${i + 1}. ${a.label} — ${formatBangkokDateTime(a.eventTimeMs)} น.`)
+      .join('\n');
+    await lineClient.replyMessage(event.replyToken, {
+      type: 'text',
+      text: `📋 นัดหมายที่กำลังจะถึง:\n${list}\n\n/ยกเลิกนัด <เลข> เพื่อยกเลิก\n/เลื่อนนัด <เลข> วันเดือนปี ชั่วโมง.นาที เพื่อเลื่อน`,
+    });
+    return;
+  }
+
+  if (text.startsWith('/ยกเลิกนัด')) {
+    const n = Number(text.slice('/ยกเลิกนัด'.length).trim());
+    const appointments = await getGroupAppointments(groupOrUserId);
+    const target = appointments[n - 1];
+    if (!Number.isInteger(n) || !target) {
+      await lineClient.replyMessage(event.replyToken, {
+        type: 'text',
+        text: 'ระบุเลขนัดหมายให้ถูกต้องครับ ดูรายการได้ที่ /นัดทั้งหมด',
+      });
+      return;
+    }
+
+    const sheetId = await getAppointmentSheetId();
+    await sheets.spreadsheets.batchUpdate({
+      spreadsheetId: process.env.GOOGLE_SHEET_ID,
+      requestBody: {
+        requests: [
+          {
+            deleteDimension: {
+              range: { sheetId, dimension: 'ROWS', startIndex: target.sheetRow - 1, endIndex: target.sheetRow },
+            },
+          },
+        ],
+      },
+    });
+    await lineClient.replyMessage(event.replyToken, { type: 'text', text: `🗑️ ยกเลิกนัดหมายแล้ว: ${target.label}` });
+    return;
+  }
+
+  if (text.startsWith('/เลื่อนนัด')) {
+    const match = text.trim().match(RESCHEDULE_COMMAND);
+    if (!match) {
+      await lineClient.replyMessage(event.replyToken, {
+        type: 'text',
+        text: 'รูปแบบไม่ถูกต้องครับ ใช้แบบนี้:\n/เลื่อนนัด เลขนัดหมาย วันเดือนปี ชั่วโมง.นาที\nเช่น /เลื่อนนัด 1 20102026 15.00\n\nดูเลขนัดหมายได้ที่ /นัดทั้งหมด',
+      });
+      return;
+    }
+
+    const [, nStr, day, month, year, hour, minute] = match;
+    const appointments = await getGroupAppointments(groupOrUserId);
+    const target = appointments[Number(nStr) - 1];
+    if (!target) {
+      await lineClient.replyMessage(event.replyToken, { type: 'text', text: 'ไม่พบนัดหมายเลขนี้ครับ ดูรายการได้ที่ /นัดทั้งหมด' });
+      return;
+    }
+
+    const newEventTimeMs = Date.UTC(
+      Number(year),
+      Number(month) - 1,
+      Number(day),
+      Number(hour) - BANGKOK_UTC_OFFSET_HOURS,
+      Number(minute)
+    );
+    if (newEventTimeMs <= Date.now()) {
+      await lineClient.replyMessage(event.replyToken, { type: 'text', text: 'เวลาใหม่ต้องเป็นเวลาในอนาคตนะครับ' });
+      return;
+    }
+
+    await sheets.spreadsheets.values.update({
+      spreadsheetId: process.env.GOOGLE_SHEET_ID,
+      range: `${SHEET_NAME}!B${target.sheetRow}:D${target.sheetRow}`,
+      valueInputOption: 'RAW',
+      requestBody: { values: [[new Date(newEventTimeMs).toISOString(), target.label, '']] },
+    });
+    await lineClient.replyMessage(event.replyToken, {
+      type: 'text',
+      text: `📅 เลื่อนนัดหมายแล้ว: ${target.label}\n📅 ${formatBangkokDateTime(newEventTimeMs)} น.`,
     });
     return;
   }
