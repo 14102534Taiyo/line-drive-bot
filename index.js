@@ -570,6 +570,18 @@ async function getGroupAppointments(groupId) {
   return appointments;
 }
 
+// Replies are free; pushes count against the LINE monthly quota (per group member).
+// The reply token expires about a minute after the webhook, so a slow Gemini call
+// can outlive it — fall back to a push in that case.
+async function replyOrPush(replyToken, to, message) {
+  try {
+    await lineClient.replyMessage(replyToken, message);
+  } catch (err) {
+    console.warn('Reply failed, falling back to push:', err.message);
+    await lineClient.pushMessage(to, message);
+  }
+}
+
 async function handleTextMessage(event) {
   const text = event.message.text.trim();
   const groupOrUserId = event.source.groupId || event.source.userId;
@@ -585,13 +597,13 @@ async function handleTextMessage(event) {
   if (text === '/สรุป') {
     try {
       const summary = await summarizeGroupSinceLastRun(groupOrUserId);
-      await lineClient.pushMessage(groupOrUserId, {
+      await replyOrPush(event.replyToken, groupOrUserId, {
         type: 'text',
         text: summary ? `📋 สรุปแชท\n\n${summary}` : 'ยังไม่มีข้อความใหม่ให้สรุปเลยครับ',
       });
     } catch (err) {
       console.error('On-demand summary failed:', err);
-      await lineClient.pushMessage(groupOrUserId, { type: 'text', text: 'สรุปไม่สำเร็จ ลองใหม่อีกครั้งครับ' });
+      await replyOrPush(event.replyToken, groupOrUserId, { type: 'text', text: 'สรุปไม่สำเร็จ ลองใหม่อีกครั้งครับ' });
     }
     return;
   }
@@ -607,10 +619,10 @@ async function handleTextMessage(event) {
     }
     try {
       const answer = await answerQuestion(groupOrUserId, question);
-      await lineClient.pushMessage(groupOrUserId, { type: 'text', text: answer });
+      await replyOrPush(event.replyToken, groupOrUserId, { type: 'text', text: answer });
     } catch (err) {
       console.error('answerQuestion failed:', err);
-      await lineClient.pushMessage(groupOrUserId, { type: 'text', text: 'ตอบไม่สำเร็จ ลองใหม่อีกครั้งครับ' });
+      await replyOrPush(event.replyToken, groupOrUserId, { type: 'text', text: 'ตอบไม่สำเร็จ ลองใหม่อีกครั้งครับ' });
     }
     return;
   }
