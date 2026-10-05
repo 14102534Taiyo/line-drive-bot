@@ -46,7 +46,6 @@ const REMINDER_LEVELS = [
   { code: '7d', ms: 7 * 24 * 60 * 60 * 1000, deferrable: true },
   { code: '3d', ms: 3 * 24 * 60 * 60 * 1000, deferrable: true },
   { code: '1d', ms: 24 * 60 * 60 * 1000, deferrable: true },
-  { code: '1h', ms: 60 * 60 * 1000 },
 ];
 const REMINDER_REPLY_GRACE_MS = 3 * 60 * 60 * 1000;
 const groupsAwaitingReminderReply = new Set();
