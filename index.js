@@ -39,12 +39,17 @@ const GEMINI_MODEL = 'gemini-flash-lite-latest';
 const BANGKOK_UTC_OFFSET_HOURS = 7;
 const pendingAppointments = new Map();
 
+// `deferrable` levels wait up to REMINDER_REPLY_GRACE_MS for someone to speak in the
+// group so the reminder can ride on that message's reply token (free) instead of a
+// push (counted against the LINE quota once per group member).
 const REMINDER_LEVELS = [
-  { code: '7d', ms: 7 * 24 * 60 * 60 * 1000, label: '7 วัน' },
-  { code: '3d', ms: 3 * 24 * 60 * 60 * 1000, label: '3 วัน' },
-  { code: '1d', ms: 24 * 60 * 60 * 1000, label: '1 วัน' },
-  { code: '1h', ms: 60 * 60 * 1000, label: '1 ชั่วโมง' },
+  { code: '7d', ms: 7 * 24 * 60 * 60 * 1000, deferrable: true },
+  { code: '3d', ms: 3 * 24 * 60 * 60 * 1000, deferrable: true },
+  { code: '1d', ms: 24 * 60 * 60 * 1000, deferrable: true },
+  { code: '1h', ms: 60 * 60 * 1000 },
 ];
+const REMINDER_REPLY_GRACE_MS = 3 * 60 * 60 * 1000;
+const groupsAwaitingReminderReply = new Set();
 
 async function ensureChatLogSheet() {
   const meta = await sheets.spreadsheets.get({ spreadsheetId: process.env.GOOGLE_SHEET_ID });
@@ -637,7 +642,9 @@ async function handleTextMessage(event) {
       spreadsheetId: process.env.GOOGLE_SHEET_ID,
       range: SHEET_RANGE,
       valueInputOption: 'RAW',
-      requestBody: { values: [[groupOrUserId, new Date(pending.eventTimeMs).toISOString(), pending.label, '']] },
+      requestBody: {
+        values: [[groupOrUserId, new Date(pending.eventTimeMs).toISOString(), pending.label, initialRemindersSent(pending.eventTimeMs)]],
+      },
     });
     pendingAppointments.delete(groupOrUserId);
     await lineClient.replyMessage(event.replyToken, {
@@ -726,7 +733,7 @@ async function handleTextMessage(event) {
       spreadsheetId: process.env.GOOGLE_SHEET_ID,
       range: `${SHEET_NAME}!B${target.sheetRow}:D${target.sheetRow}`,
       valueInputOption: 'RAW',
-      requestBody: { values: [[new Date(newEventTimeMs).toISOString(), target.label, '']] },
+      requestBody: { values: [[new Date(newEventTimeMs).toISOString(), target.label, initialRemindersSent(newEventTimeMs)]] },
     });
     await lineClient.replyMessage(event.replyToken, {
       type: 'text',
@@ -759,7 +766,7 @@ async function handleTextMessage(event) {
     range: SHEET_RANGE,
     valueInputOption: 'RAW',
     requestBody: {
-      values: [[groupOrUserId, new Date(appointment.eventTimeMs).toISOString(), appointment.label, 'FALSE']],
+      values: [[groupOrUserId, new Date(appointment.eventTimeMs).toISOString(), appointment.label, initialRemindersSent(appointment.eventTimeMs)]],
     },
   });
 
@@ -774,11 +781,93 @@ async function handleEvent(event) {
   await logChatMessage(event).catch((err) => console.error('logChatMessage failed:', err));
 
   const { message } = event;
+  // Commands spend the reply token on their own answer; any other message leaves it
+  // free to carry reminders that are waiting on one.
+  const isCommand = message.type === 'text' && message.text.trim().startsWith('/');
+  if (!isCommand) {
+    await replyDueReminders(event).catch((err) => console.error('replyDueReminders failed:', err));
+  }
+
   if (message.type === 'image' || message.type === 'file') {
     await handleFileMessage(message, event.source);
   } else if (message.type === 'text') {
     await handleTextMessage(event);
   }
+}
+
+function getDueReminderLevels(eventTimeMs, remindersSent, now) {
+  return REMINDER_LEVELS.filter((level) => !remindersSent.includes(level.code) && now >= eventTimeMs - level.ms);
+}
+
+// Levels whose moment has already passed when an appointment is created or moved are
+// recorded as sent, so a near-term appointment doesn't trigger a reminder straight away.
+function initialRemindersSent(eventTimeMs) {
+  return getDueReminderLevels(eventTimeMs, [], Date.now())
+    .map((level) => level.code)
+    .join(',');
+}
+
+function formatTimeRemaining(ms) {
+  const totalMinutes = Math.round(ms / (60 * 1000));
+  if (totalMinutes < 60) return `${totalMinutes} นาที`;
+
+  const totalHours = Math.round(totalMinutes / 60);
+  if (totalHours < 24) return `${totalHours} ชั่วโมง`;
+
+  const days = Math.floor(totalHours / 24);
+  const hours = totalHours % 24;
+  return hours ? `${days} วัน ${hours} ชั่วโมง` : `${days} วัน`;
+}
+
+function buildReminderText(label, eventTimeMs, now) {
+  return `⏰ เตือนความจำ (อีกประมาณ ${formatTimeRemaining(eventTimeMs - now)} ถึงเวลานัด): ${label}\nกำหนดการ: ${formatBangkokDateTime(eventTimeMs)} น.`;
+}
+
+async function markRemindersSent(sheetRow, remindersSent) {
+  await sheets.spreadsheets.values.update({
+    spreadsheetId: process.env.GOOGLE_SHEET_ID,
+    range: `${SHEET_NAME}!D${sheetRow}`,
+    valueInputOption: 'RAW',
+    requestBody: { values: [[remindersSent.join(',')]] },
+  });
+}
+
+// groupsAwaitingReminderReply is only a cheap hint so ordinary chat messages don't each
+// cost a Sheets read; the sheet is re-read here and remains the source of truth.
+async function replyDueReminders(event) {
+  const groupId = event.source.groupId || event.source.userId;
+  if (!groupsAwaitingReminderReply.delete(groupId)) return;
+
+  const res = await sheets.spreadsheets.values.get({
+    spreadsheetId: process.env.GOOGLE_SHEET_ID,
+    range: SHEET_RANGE,
+  });
+  const rows = res.data.values || [];
+  const now = Date.now();
+
+  const texts = [];
+  const updates = [];
+  for (let i = 0; i < rows.length; i++) {
+    const [rowGroupId, eventTimeIso, label, remindersSentRaw] = rows[i];
+    if (rowGroupId !== groupId || !eventTimeIso) continue;
+
+    const eventTimeMs = new Date(eventTimeIso).getTime();
+    if (!Number.isFinite(eventTimeMs) || now >= eventTimeMs) continue;
+
+    const remindersSent = (remindersSentRaw || '').split(',').filter(Boolean);
+    const due = getDueReminderLevels(eventTimeMs, remindersSent, now);
+    if (due.length === 0) continue;
+
+    texts.push(buildReminderText(label, eventTimeMs, now));
+    updates.push({ sheetRow: i + 1, remindersSent: [...remindersSent, ...due.map((level) => level.code)] });
+  }
+  if (texts.length === 0) return;
+
+  await lineClient.replyMessage(event.replyToken, { type: 'text', text: texts.join('\n\n') });
+  for (const { sheetRow, remindersSent } of updates) {
+    await markRemindersSent(sheetRow, remindersSent);
+  }
+  console.log(`Replied ${texts.length} reminder(s) in group ${groupId}`);
 }
 
 async function checkReminders() {
@@ -788,38 +877,41 @@ async function checkReminders() {
   });
   const rows = res.data.values || [];
   const now = Date.now();
+  const awaitingReply = new Set();
 
   for (let i = 0; i < rows.length; i++) {
     const [groupId, eventTimeIso, label, remindersSentRaw] = rows[i];
     if (!eventTimeIso) continue;
 
     const eventTimeMs = new Date(eventTimeIso).getTime();
-    if (now >= eventTimeMs) continue;
+    if (!Number.isFinite(eventTimeMs) || now >= eventTimeMs) continue;
 
     const remindersSent = (remindersSentRaw || '').split(',').filter(Boolean);
-    let changed = false;
-    for (const level of REMINDER_LEVELS) {
-      if (remindersSent.includes(level.code)) continue;
-      if (now < eventTimeMs - level.ms) continue;
+    const due = getDueReminderLevels(eventTimeMs, remindersSent, now);
+    if (due.length === 0) continue;
 
-      await lineClient.pushMessage(groupId, {
-        type: 'text',
-        text: `⏰ เตือนความจำ (อีก${level.label}ถึงเวลานัด): ${label}\nกำหนดการ: ${formatBangkokDateTime(eventTimeMs)} น.`,
-      });
-      remindersSent.push(level.code);
-      changed = true;
-      console.log(`Reminded "${label}" (${level.code}) in group ${groupId}`);
+    const mustPush = due.some(
+      (level) => !level.deferrable || now >= eventTimeMs - level.ms + REMINDER_REPLY_GRACE_MS
+    );
+    if (!mustPush) {
+      awaitingReply.add(groupId);
+      continue;
     }
 
-    if (changed) {
-      await sheets.spreadsheets.values.update({
-        spreadsheetId: process.env.GOOGLE_SHEET_ID,
-        range: `${SHEET_NAME}!D${i + 1}`,
-        valueInputOption: 'RAW',
-        requestBody: { values: [[remindersSent.join(',')]] },
-      });
+    // One message covers every level that is due, and one failing row (e.g. the bot was
+    // removed from that group) must not stop the reminders for the rows after it.
+    try {
+      await lineClient.pushMessage(groupId, { type: 'text', text: buildReminderText(label, eventTimeMs, now) });
+      const codes = due.map((level) => level.code);
+      await markRemindersSent(i + 1, [...remindersSent, ...codes]);
+      console.log(`Reminded "${label}" (${codes.join(',')}) in group ${groupId}`);
+    } catch (err) {
+      console.error(`Reminder for "${label}" in group ${groupId} failed:`, err.message);
     }
   }
+
+  groupsAwaitingReminderReply.clear();
+  for (const groupId of awaitingReply) groupsAwaitingReminderReply.add(groupId);
 }
 
 const app = express();
@@ -883,53 +975,19 @@ app.get('/oauth2callback', async (req, res) => {
   }
 });
 
-app.get('/cron/daily-summary', async (req, res) => {
+// This used to push a summary into every group each day, which cost one LINE quota
+// message per group member per day. Summaries are now on demand only (/สรุป, sent as a
+// free reply); what's left is the daily ChatLog prune. The old /cron/daily-summary path
+// is kept so an already-configured external cron job keeps working.
+app.get(['/cron/daily-maintenance', '/cron/daily-summary'], async (req, res) => {
   if (req.query.secret !== process.env.CRON_SECRET) return res.sendStatus(401);
 
   try {
     await flushChatLogBuffer();
-
-    const result = await sheets.spreadsheets.values.get({
-      spreadsheetId: process.env.GOOGLE_SHEET_ID,
-      range: CHAT_LOG_RANGE,
-    });
-    const rows = (result.data.values || []).slice(1);
-
-    const byGroup = new Map();
-    for (const row of rows) {
-      const groupId = row[0];
-      if (!byGroup.has(groupId)) byGroup.set(groupId, []);
-      byGroup.get(groupId).push(row);
-    }
-
-    const results = await Promise.all(
-      Array.from(byGroup, async ([groupId, groupRows]) => {
-        try {
-          const lastSummarizedAt = await getLastSummarizedAt(groupId);
-          const sinceMs = Math.max(lastSummarizedAt ? new Date(lastSummarizedAt).getTime() : 0, getStartOfTodayBangkokMs());
-          const newRows = groupRows.filter((r) => new Date(r[1]).getTime() > sinceMs);
-          if (newRows.length === 0) return { groupId, status: 'skipped' };
-
-          const lines = newRows.map(([, , senderName, , text]) => `${senderName}: ${text}`);
-          const { summary, appointments } = await summarizeAndDetectAppointments(lines.join('\n'));
-          await lineClient.pushMessage(groupId, { type: 'text', text: `📋 สรุปแชทวันนี้\n\n${summary}` });
-          await setLastSummarizedAt(groupId, new Date().toISOString());
-          await announcePendingAppointments(groupId, appointments).catch((err) =>
-            console.error('announcePendingAppointments failed:', err)
-          );
-          return { groupId, status: 'ok', summary };
-        } catch (err) {
-          console.error(`Failed to summarize group ${groupId}:`, err);
-          return { groupId, status: 'error', message: err.message };
-        }
-      })
-    );
-
     await pruneOldChatLog();
-
-    res.json({ groupsProcessed: byGroup.size, results });
+    res.json({ pruned: true });
   } catch (err) {
-    console.error('daily-summary failed:', err);
+    console.error('daily-maintenance failed:', err);
     res.sendStatus(500);
   }
 });
